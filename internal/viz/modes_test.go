@@ -35,8 +35,36 @@ func TestBeatCooldown(t *testing.T) {
 	if b.trig(0.5, now.Add(50*time.Millisecond)) {
 		t.Error("second onset within cooldown should not trigger")
 	}
-	if !b.trig(0.5, now.Add(200*time.Millisecond)) {
-		t.Error("onset after cooldown should trigger")
+	// Hysteresis: a sustained loud section must not re-fire even after
+	// the cooldown; the signal has to dip first (debounce re-arm).
+	if b.trig(0.5, now.Add(200*time.Millisecond)) {
+		t.Error("sustained level must not re-fire without a dip")
+	}
+	// Dip near the average re-arms, then the next onset fires.
+	b.trig(0.05, now.Add(210*time.Millisecond))
+	if !b.trig(0.5, now.Add(400*time.Millisecond)) {
+		t.Error("onset after dip + cooldown should trigger")
+	}
+}
+
+func TestBeatChatterSuppressed(t *testing.T) {
+	b := beatTracker{cooldown: 120 * time.Millisecond}
+	now := time.Now()
+	b.ema = 0.05
+	fires := 0
+	// Simulate a loud section hovering at the threshold for a full
+	// second: exactly one onset may fire, never a chatter stream.
+	for i := 0; i < 60; i++ {
+		lvl := 0.5
+		if i%2 == 0 {
+			lvl = 0.52
+		}
+		if b.trig(lvl, now.Add(time.Duration(i)*time.Second/60)) {
+			fires++
+		}
+	}
+	if fires != 1 {
+		t.Errorf("hovering signal fired %d times, want exactly 1", fires)
 	}
 }
 

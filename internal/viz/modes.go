@@ -143,11 +143,16 @@ func smooth(cur, target, dt, attackRate, fallRate float64) float64 {
 	return cur + (target-cur)*minF(1, dt*rate)
 }
 
-// beatTracker triggers on bass onsets above a rolling average.
+// beatTracker triggers on bass onsets above a rolling average. It is a
+// Schmitt trigger: firing disarms it until the signal dips back near the
+// average, so a loud sustained section cannot chatter at the threshold and
+// strobe-like consumers cannot average out to a constant glow. The
+// cooldown is a backstop rate limit on top.
 type beatTracker struct {
 	ema      float64
 	last     time.Time
 	cooldown time.Duration
+	fired    bool // set on fire, cleared when bass dips to re-arm
 }
 
 // DefaultBeatCooldown is the production cooldown between ripple triggers.
@@ -155,8 +160,17 @@ const DefaultBeatCooldown = 120 * time.Millisecond
 
 func (b *beatTracker) trig(bass float64, now time.Time) bool {
 	b.ema += (bass - b.ema) * 0.06
+	if b.fired {
+		// Re-arm only on a genuine dip: the cooldown alone cannot
+		// separate a sustained loud section from repeated onsets.
+		if bass < b.ema*1.15 {
+			b.fired = false
+		}
+		return false
+	}
 	if bass > b.ema*1.4 && bass > 0.10 && now.Sub(b.last) > b.cooldown {
 		b.last = now
+		b.fired = true
 		return true
 	}
 	return false
