@@ -9,8 +9,24 @@ flows through the `ak820` binary: key geometry comes from
 
 - **mole** — whack-a-mole on the physical keyboard. A key lights up, hit it
   before the bar empties. Combos, golden moles, lives, persistent high score.
-- **visualizer** — audio spectrum on the keyboard and in the terminal, fed by
-  [cava](https://github.com/karlstav/cava). Themes: synthwave, ocean, fire.
+- **visualizer** — audio on the keyboard and in the terminal, fed by
+  [cava](https://github.com/karlstav/cava). Five geometric modes, cycled live
+  with `m`/`tab`:
+
+  - **ripple** — bass beats fire concentric shockwaves from the center keys;
+    treble sparkles on the perimeter. Ripples stay circular by modeling the
+    board's 2.8:1 physical aspect.
+  - **bars** — straight vertical equalizer: band from the key's x position,
+    lit strictly by row height, with falling peak markers.
+  - **bloom** — dual stereo bubbles under the left (E/D) and right (I/K)
+    hands expand and contract with the left/right channels, blending colors
+    where they meet.
+  - **plasma** — an undulating surface: bass drives height, mids drive phase,
+    treble adds turbulence.
+  - **wings** — bass pulses from the center keys and fans outward toward Esc
+    and Enter.
+
+  Themes: synthwave, ocean, fire (`t` cycles).
 
 ## Install
 
@@ -28,7 +44,7 @@ make install    # builds, tests, installs to ~/.local/bin
 ```sh
 ak820-utils mole
 AK820_UTILS_JSON=1 ak820-utils mole   # end-of-run stats as JSON
-ak820-utils visualizer --theme ocean  # t cycles themes, q quits
+ak820-utils visualizer --theme ocean  # m/tab cycles modes, t themes, q quits
 ```
 
 ## Dependencies

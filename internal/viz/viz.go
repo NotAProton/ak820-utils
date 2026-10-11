@@ -70,12 +70,17 @@ func ThemeNames() []string {
 	return out
 }
 
-// keyCell places one physical key in the bar grid (bar column, row).
+// keyCell is one physical key: its RGB slot, its normalized board
+// position, and its physical x (aspect-corrected) for radial effects.
 type keyCell struct {
-	slot int
-	bar  int
-	row  int // 0 = top row
+	slot   int
+	bar    int
+	row    int
+	x, y   float64
+	px, py float64
 }
+
+var ambient = [3]byte{2, 0, 8}
 
 // layout assigns every addressable key a bar column and row, following the
 // keyboard's physical geometry (row bands top to bottom, x-order within).
@@ -103,11 +108,16 @@ func layout(board *kb.KB) []keyCell {
 			if !ok {
 				continue
 			}
-			bar := int(rowX[r][i] * numBars)
+			x := rowX[r][i]
+			bar := int(x * numBars)
 			if bar >= numBars {
 				bar = numBars - 1
 			}
-			cells = append(cells, keyCell{slot: slot, bar: bar, row: r})
+			cells = append(cells, keyCell{
+				slot: slot, bar: bar, row: r,
+				x: x, y: float64(r) / float64(numRows-1),
+				px: x * kbAspect, py: float64(r) / float64(numRows-1),
+			})
 		}
 	}
 	return cells
@@ -127,6 +137,11 @@ type Model struct {
 	rng       *rand.Rand
 	errMsg    string
 	lastFrame time.Time
+
+	modeIx int
+	fx     modeState
+	startT time.Time
+	spec   spectrum
 }
 
 // New builds the model and starts cava.
@@ -135,7 +150,8 @@ func New(board *kb.KB, themeName string) (Model, error) {
 		kb: board, cells: layout(board),
 		bars: make([]float64, numBars), peaks: make([]float64, numBars),
 		raw: make(chan cavaMsg, 8), quit: make(chan struct{}),
-		rng: rand.New(rand.NewSource(time.Now().UnixNano())),
+		rng:    rand.New(rand.NewSource(time.Now().UnixNano())),
+		startT: time.Now(),
 	}
 	m.themeIx = indexOfTheme(themeName)
 	if err := m.startCava(); err != nil {
@@ -164,11 +180,12 @@ func (m *Model) startCava() error {
 	fmt.Fprintf(cfg, `[general]
 bars = %d
 framerate = 60
+sensitivity = 130
 
 [input]
 method = pulse
 source = @DEFAULT_MONITOR@
-channels = mono
+channels = stereo
 
 [output]
 method = raw
@@ -242,7 +259,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			dt = 1.0 / 60.0
 		}
 		m.lastFrame = now
-		// Frame-rate-independent attack/decay.
+		// Smooth the raw bars for the terminal spectrum.
 		attack := minF(1.0, dt*25)
 		fall := minF(1.0, dt*18)
 		for i, v := range msg {
@@ -258,7 +275,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.peaks[i] -= 0.45 * dt
 			}
 		}
-		m.paintKeyboard()
+		// Fold the frame into the shared spectrum the modes read.
+		deriveSpectrum(&m.spec, msg, dt)
+		if m.fx.beats.trig(m.spec.bass, now) {
+			m.fx.ripples = append(m.fx.ripples,
+				ripple{start: now, amp: 0.55 + 0.45*m.spec.bass})
+			if len(m.fx.ripples) > 8 {
+				m.fx.ripples = m.fx.ripples[len(m.fx.ripples)-8:]
+			}
+		}
+		m.paintKeyboard(now, dt)
 		return m, m.listenCava()
 	case tickMsg:
 		return m, m.tick()
@@ -266,6 +292,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c", "esc", "q":
 			return m, tea.Quit
+		case "m", "tab":
+			m.modeIx = (m.modeIx + 1) % numModes
 		case "t":
 			m.themeIx = (m.themeIx + 1) % len(themes)
 		}
@@ -273,22 +301,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// paintKeyboard maps bar heights onto key rows (bottom rows light first).
-func (m *Model) paintKeyboard() {
+// paintKeyboard paints every mode's per-key colors and flushes to the board.
+func (m *Model) paintKeyboard(now time.Time, dt float64) {
 	t := themes[m.themeIx]
+	m.fx.frame++
 	for _, c := range m.cells {
-		lvl := m.bars[c.bar]
-		pk := m.peaks[c.bar]
-		height := float64(numRows-1-c.row) / float64(numRows-1)
-		switch {
-		case lvl > 0.01 && height <= lvl:
-			r, g, b := gradRGB(t.keyGrad, lvl)
-			m.kb.SetSlot(c.slot, r, g, b)
-		case abs(height-pk) < 0.14 && pk > 0.15:
-			m.kb.SetSlot(c.slot, t.peakRGB[0], t.peakRGB[1], t.peakRGB[2])
+		var rgb [3]byte
+		switch m.modeIx {
+		case modeBars:
+			rgb = m.paintBars(c, t, &m.spec)
+		case modeBloom:
+			rgb = m.paintBloom(c, t, dt, &m.spec)
+		case modePlasma:
+			rgb = m.paintPlasma(c, t, now, &m.spec)
+		case modeWings:
+			rgb = m.paintWings(c, t, dt, &m.spec)
 		default:
-			m.kb.SetSlot(c.slot, 2, 0, 8)
+			rgb = m.paintRipple(c, t, now, &m.spec)
 		}
+		m.kb.SetSlot(c.slot, rgb[0], rgb[1], rgb[2])
 	}
 	_ = m.kb.Flush()
 }
@@ -319,8 +350,8 @@ func (m Model) View() string {
 	t := themes[m.themeIx]
 	var b strings.Builder
 	b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).
-		Render(fmt.Sprintf(" AK820 SPECTRUM — %s ", t.name)) +
-		dimStyle().Render("  t: theme   q: quit") + "\n")
+		Render(fmt.Sprintf(" AK820 SPECTRUM — %s — %s ", t.name, modeNames[m.modeIx])) +
+		dimStyle().Render("  m/tab: mode   t: theme   q: quit") + "\n")
 
 	// Spectrum: top row first; each cell shows the bar level at that height.
 	var rows []string
