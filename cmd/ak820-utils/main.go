@@ -89,6 +89,10 @@ func runMole() int {
 		return code
 	}
 	defer board.Close()
+	if err := board.EnterCustomMode(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 2
+	}
 
 	prog := tea.NewProgram(mole.New(board), tea.WithAltScreen())
 	final, err := prog.Run()
@@ -123,6 +127,10 @@ func runVisualizer(theme string) int {
 		return code
 	}
 	defer board.Close()
+	if err := board.EnterCustomMode(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 2
+	}
 
 	m, err := viz.New(board, theme)
 	if err != nil {

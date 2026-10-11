@@ -57,6 +57,7 @@ type Model struct {
 	roundStart time.Time
 	maxTime    float64
 	feedback   string
+	errMsg     string
 	quitting   bool
 	start      time.Time
 }
@@ -205,7 +206,7 @@ func (m *Model) registerMiss(why string) {
 }
 
 // paint refreshes the board: ambient everywhere, target lit.
-func (m Model) paint() {
+func (m *Model) paint() {
 	m.kb.SetAll(ambientR, ambientG, ambientB)
 	r, g, b := moleR, moleG, moleB
 	if m.golden {
@@ -214,7 +215,9 @@ func (m Model) paint() {
 	if slot, ok := m.kb.Key(m.target); ok {
 		m.kb.SetSlot(slot, byte(r), byte(g), byte(b))
 	}
-	_ = m.kb.Flush()
+	if err := m.kb.Flush(); err != nil {
+		m.errMsg = err.Error()
+	}
 }
 
 // View renders the HUD.
@@ -250,6 +253,9 @@ func (m Model) View() string {
 	b.WriteString("\n target " + target + "  " + barS + "\n")
 	if m.feedback != "" {
 		b.WriteString("\n " + m.feedback + "\n")
+	}
+	if m.errMsg != "" {
+		b.WriteString("\n " + missStyle.Render("keyboard error: "+m.errMsg) + "\n")
 	}
 	return b.String()
 }

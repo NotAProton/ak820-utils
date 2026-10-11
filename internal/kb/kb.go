@@ -120,7 +120,7 @@ func (k *KB) Flush() error {
 		for s := f * k.perFrame; s < (f+1)*k.perFrame && s < len(k.slots); s++ {
 			payload = append(payload, k.slots[s]...)
 		}
-		fmt.Fprintf(&buf, "%02x %s\n", int(k.cmdBase)+f, hex.EncodeToString(payload))
+		fmt.Fprintf(&buf, "0x%02x %s\n", int(k.cmdBase)+f, hex.EncodeToString(payload))
 	}
 	if _, err := k.stdin.Write(buf.Bytes()); err != nil {
 		return k.pipeError(err)
@@ -132,7 +132,7 @@ func (k *KB) Flush() error {
 func (k *KB) sendRaw(cmd byte, payload []byte) error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	_, err := fmt.Fprintf(k.stdin, "%02x %s\n", cmd, hex.EncodeToString(payload))
+	_, err := fmt.Fprintf(k.stdin, "0x%02x %s\n", cmd, hex.EncodeToString(payload))
 	return k.pipeError(err)
 }
 
