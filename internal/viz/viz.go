@@ -97,12 +97,16 @@ func ThemeNames() []string {
 
 // keyCell is one physical key: its RGB slot, its normalized board
 // position, and its physical x (aspect-corrected) for radial effects.
+// Accent keys (top row plus the nav cluster) carry a rainbow index for the
+// tempo-synced overlay.
 type keyCell struct {
-	slot   int
-	bar    int
-	row    int
-	x, y   float64
-	px, py float64
+	slot     int
+	bar      int
+	row      int
+	x, y     float64
+	px, py   float64
+	accent   bool
+	accentIx int
 }
 
 var ambient = [3]byte{2, 0, 8}
@@ -129,6 +133,7 @@ func layout(board *kb.KB) []keyCell {
 		{0.04, 0.09, 0.14, 0.22, 0.45, 0.49, 0.53, 0.58, 0.62, 0.66},
 	}
 	var cells []keyCell
+	accentIx := 0
 	for r, row := range rows {
 		if r >= len(rowX) {
 			continue
@@ -149,10 +154,23 @@ func layout(board *kb.KB) []keyCell {
 			if bar < 0 {
 				bar = 0
 			}
+			// The accent overlay owns the full top row (Esc, F1-F12,
+			// Del) plus the nav cluster (Home, PgUp, PgDn, End).
+			// Indices run left to right along the top row, then in
+			// row order through the nav keys, so the rainbow spreads
+			// across the board instead of repeating per key.
+			accent := r == 0 ||
+				name == "home" || name == "pgup" || name == "pgdn" || name == "end"
+			ix := -1
+			if accent {
+				ix = accentIx
+				accentIx++
+			}
 			cells = append(cells, keyCell{
 				slot: slot, bar: bar, row: r,
 				x: x, y: float64(r) / float64(numRows-1),
 				px: x * kbAspect, py: float64(r) / float64(numRows-1),
+				accent: accent, accentIx: ix,
 			})
 		}
 	}
@@ -202,11 +220,19 @@ func New(board *kb.KB, themeName string) (Model, error) {
 	m.lastFrame = time.Now()
 	m.lastPaint = time.Now()
 	m.fx.beats.cooldown = DefaultBeatCooldown
+	m.fx.accentOn = true
+	m.fx.beatPeriod = 0.5
 	if err := m.startCava(); err != nil {
 		m.cleanupFailedStart()
 		return Model{}, err
 	}
 	return m, nil
+}
+
+// SetAccent enables or disables the tempo-synced rainbow overlay on the
+// top row and nav cluster. It applies live and is safe to call before Run.
+func (m *Model) SetAccent(on bool) {
+	m.fx.accentOn = on
 }
 
 func indexOfTheme(name string) (int, bool) {
@@ -383,6 +409,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Fold the frame into the shared spectrum the modes read.
 		deriveSpectrum(&m.spec, msg, dt)
 		if m.fx.beats.trig(m.spec.bass, now) {
+			m.fx.noteBeat(now)
 			m.fx.ripples = append(m.fx.ripples,
 				ripple{start: now, amp: 0.55 + 0.45*m.spec.bass})
 			if len(m.fx.ripples) > 8 {
@@ -433,6 +460,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(themes) > 0 {
 				m.themeIx = (m.themeIx + 1) % len(themes)
 			}
+		case "a":
+			m.fx.accentOn = !m.fx.accentOn
 		}
 	}
 	return m, nil
@@ -471,6 +500,11 @@ func (m *Model) paintKeyboard(now time.Time, dt float64) {
 			rgb = m.paintWings(c, t, dt, &m.spec)
 		default:
 			rgb = m.paintRipple(c, t, now, &m.spec)
+		}
+		// The accent overlay owns the top row and nav cluster in every
+		// mode when enabled; other keys always show the active mode.
+		if m.fx.accentOn && c.accent {
+			rgb = m.paintAccent(c, now, &m.spec)
 		}
 		m.kb.SetSlot(c.slot, rgb[0], rgb[1], rgb[2])
 	}
@@ -539,7 +573,8 @@ func (m Model) View() string {
 	header := lipgloss.JoinHorizontal(lipgloss.Center,
 		ui.Badge("ak820 spectrum", true), " ",
 		ui.Pill(t.name, ui.ColorSparkleGold), " ",
-		ui.Pill(modeNames[modeIx], ui.ColorRainbowBlue))
+		ui.Pill(modeNames[modeIx], ui.ColorRainbowBlue), " ",
+		accentPill(m.fx.accentOn))
 
 	strip := ui.RenderRainbowStrip(width - 4)
 
@@ -597,7 +632,8 @@ func (m Model) View() string {
 	lvlBar := strings.Repeat("■", level) + strings.Repeat("·", 12-level)
 	sideBody := "MODES\n" + strings.Join(modeLines, "\n") +
 		"\n\nTHEMES\n" + strings.Join(themeLines, "\n") +
-		"\n\nLEVEL " + fgStyle(string(ui.ColorRainbowGreen)).Render(lvlBar)
+		"\n\nACCENT " + accentState(m.fx.accentOn) +
+		"\nLEVEL " + fgStyle(string(ui.ColorRainbowGreen)).Render(lvlBar)
 	if m.spec.quietFor >= 2 {
 		sideBody += "\n" + ui.StyleDim.Render("✧ idle drift — play audio")
 	}
@@ -608,8 +644,22 @@ func (m Model) View() string {
 	if lipgloss.Width(body) > width {
 		body = specCard + "\n" + sideCard
 	}
-	help := ui.StyleDim.Render(" m/tab: mode ✦ t: theme ✦ q: quit")
+	help := ui.StyleDim.Render(" m/tab: mode ✦ t: theme ✦ a: accent ✦ q: quit")
 	return header + "\n" + strip + "\n" + body + "\n" + help
+}
+
+// accentState reports the overlay toggle for the side card.
+func accentState(on bool) string {
+	if on {
+		return ui.StyleMain.Render("» rainbow tempo ★")
+	}
+	return ui.StyleDim.Render("· off (a to enable)")
+}
+func accentPill(on bool) string {
+	if on {
+		return ui.Pill("ACCENT", ui.ColorRainbowGreen)
+	}
+	return ui.StyleDim.Render("accent off")
 }
 
 func colorIndex(lvl float64) int {

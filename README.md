@@ -32,6 +32,10 @@ flows through the `ak820` binary: key geometry comes from
   Themes: synthwave, ocean, fire (`t` cycles). The terminal uses rounded
   cards, rainbow ribbons, and pills, and adapts to narrow windows.
 
+  Tempo accent: Esc, F1–F12, Del, Home, PgUp, PgDn, and End play a
+  mode-independent rainbow that steps hue on every bass beat and pulses
+  with the kick. On by default; `a` toggles live.
+
 ## Install
 
 Requires the [ak820](https://github.com/NotAProton/ak820-go-drivers) core in
@@ -48,7 +52,8 @@ make install    # builds, tests, installs to ~/.local/bin
 ```sh
 ak820-utils mole
 AK820_UTILS_JSON=1 ak820-utils mole   # end-of-run stats as JSON
-ak820-utils visualizer --theme ocean  # m/tab cycles modes, t themes, q quits
+ak820-utils visualizer --theme ocean  # m/tab cycles modes, t themes, a accent, q quits
+ak820-utils visualizer --accent-rainbow=false  # modes only, no tempo row
 ```
 
 ## Dependencies

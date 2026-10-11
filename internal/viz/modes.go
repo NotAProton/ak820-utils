@@ -184,6 +184,10 @@ const (
 	rippleSpread = 0.10 // ring width (gaussian sigma)
 )
 
+// numAccentKeys is the accent row size (14 top-row keys plus 4 nav keys)
+// used to spread the rainbow hue across the overlay.
+const numAccentKeys = 18
+
 // modeState carries all per-mode dynamics across frames.
 type modeState struct {
 	beats   beatTracker
@@ -192,6 +196,66 @@ type modeState struct {
 	bloomL  spring
 	bloomR  spring
 	frame   uint32
+
+	accentOn   bool
+	beatCount  uint64
+	lastBeat   time.Time
+	beatPeriod float64 // seconds between beats, EMA
+}
+
+// noteBeat records a bass onset for the tempo-synced accent overlay. The
+// period EMA is clamped to a musical range so stray triggers cannot freeze
+// or strobe the rainbow.
+func (fx *modeState) noteBeat(now time.Time) {
+	if fx.beatPeriod <= 0 {
+		fx.beatPeriod = 0.5
+	}
+	if !fx.lastBeat.IsZero() {
+		if p := now.Sub(fx.lastBeat).Seconds(); p > 0 {
+			if p < 0.25 {
+				p = 0.25
+			}
+			if p > 1.5 {
+				p = 1.5
+			}
+			fx.beatPeriod += (p - fx.beatPeriod) * 0.3
+		}
+	}
+	fx.lastBeat = now
+	fx.beatCount++
+}
+
+// paintAccent renders the mode-independent tempo overlay for the top row
+// and nav cluster: a rainbow that steps one full cycle every eight beats
+// and pulses bright on each onset. Hue spreads across the row so the board
+// shows a spectrum, not a single flashing color.
+func (m *Model) paintAccent(c keyCell, now time.Time, sp *spectrum) [3]byte {
+	tt := now.Sub(m.startT).Seconds()
+	if sp.quietFor >= 2 {
+		hue := tt*0.05 + float64(c.accentIx)/numAccentKeys
+		hue -= math.Floor(hue)
+		r, g, b := hsvRGB(hue, 0.7, 0.15)
+		return [3]byte{r, g, b}
+	}
+	period := m.fx.beatPeriod
+	if period <= 0 {
+		period = 0.5
+	}
+	age := tt
+	if !m.fx.lastBeat.IsZero() {
+		age = now.Sub(m.fx.lastBeat).Seconds()
+		if age < 0 {
+			age = 0
+		}
+	}
+	pulse := math.Exp(-age * 2.5)
+	ag := sp.gain()
+	floor := 0.22 + 0.25*minF(1, sp.overall*ag)
+	v := clamp01(floor + 0.78*pulse*(0.35+0.65*minF(1, sp.bass*ag+sp.flux*0.5)))
+	hue := float64(m.fx.beatCount)/8 + float64(c.accentIx)/numAccentKeys
+	hue -= math.Floor(hue)
+	r, g, b := hsvRGB(hue, 0.9, boost(v))
+	return [3]byte{r, g, b}
 }
 
 // flicker returns a deterministic 0..1 sparkle for a slot. It interpolates

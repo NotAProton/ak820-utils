@@ -152,6 +152,78 @@ func TestFlickerStable(t *testing.T) {
 	_ = fx.twinkle(9, 12.5, 0)
 }
 
+func TestAccentBeatTempo(t *testing.T) {
+	fx := &modeState{beatPeriod: 0.5}
+	now := time.Now()
+	fx.noteBeat(now)
+	if fx.beatCount != 1 {
+		t.Fatalf("beatCount = %d, want 1", fx.beatCount)
+	}
+	// Absurd intervals clamp into the musical range.
+	fx.noteBeat(now.Add(10 * time.Second))
+	if fx.beatPeriod > 1.5 {
+		t.Errorf("period escaped clamp: %v", fx.beatPeriod)
+	}
+	fx.noteBeat(now.Add(10*time.Second + time.Millisecond))
+	if fx.beatPeriod < 0.25 {
+		t.Errorf("period escaped clamp: %v", fx.beatPeriod)
+	}
+	// Zero-value tracker self-initializes instead of dividing by zero.
+	fx2 := &modeState{}
+	fx2.noteBeat(now)
+	if fx2.beatPeriod <= 0 || fx2.beatCount != 1 {
+		t.Errorf("zero tracker not initialized: %+v", fx2)
+	}
+}
+
+func TestAccentPaintCyclesHue(t *testing.T) {
+	m := &Model{startT: time.Now()}
+	now := time.Now()
+	m.fx.accentOn = true
+	m.fx.beatPeriod = 0.5
+	hot := &spectrum{bass: 0.8, overall: 0.7, flux: 0.4}
+	hot.agc = 0.45
+	c := keyCell{slot: 3, accent: true, accentIx: 0}
+	m.fx.noteBeat(now)
+	a := m.paintAccent(c, now, hot)
+	// One beat later the hue must have stepped (same key, new count).
+	m.fx.noteBeat(now.Add(500 * time.Millisecond))
+	b := m.paintAccent(c, now.Add(500*time.Millisecond), hot)
+	if a == b {
+		t.Error("hue must step on each beat")
+	}
+	// Neighbors must differ: the rainbow spreads across the row.
+	c2 := keyCell{slot: 4, accent: true, accentIx: 9}
+	d := m.paintAccent(c2, now.Add(500*time.Millisecond), hot)
+	if b == d {
+		t.Error("accent hue must spread across keys")
+	}
+	// Silence renders a dim drift, never black strobe or full blast.
+	quiet := &spectrum{quietFor: 30}
+	q := m.paintAccent(c, now, quiet)
+	lum := int(q[0]) + int(q[1]) + int(q[2])
+	if lum == 0 || lum > 200 {
+		t.Errorf("idle accent lum %d out of dim range", lum)
+	}
+}
+
+func TestAccentToggleKey(t *testing.T) {
+	m := Model{
+		bars: make([]float64, numBars), peaks: make([]float64, numBars),
+		width: 80, startT: time.Now(),
+	}
+	m.fx.accentOn = true
+	km := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}}
+	updated, _ := m.Update(km)
+	if updated.(Model).fx.accentOn {
+		t.Error("'a' must disable the accent overlay")
+	}
+	updated, _ = updated.(Model).Update(km)
+	if !updated.(Model).fx.accentOn {
+		t.Error("'a' must re-enable the accent overlay")
+	}
+}
+
 func TestDeriveParallelIndependent(t *testing.T) {
 	raw := make([]int, numBars)
 	for i := range raw {
