@@ -28,43 +28,120 @@ func TestDeriveMonoBands(t *testing.T) {
 func TestBeatCooldown(t *testing.T) {
 	b := beatTracker{cooldown: 120 * time.Millisecond}
 	now := time.Now()
-	b.ema = 0.05
-	if !b.trig(0.5, now) {
+	// Prime the window with quiet so the detector is armed.
+	for i := 0; i < minBeatContext; i++ {
+		if b.update(0.05, now.Add(time.Duration(i)*time.Second/60)) {
+			t.Fatal("quiet context must not fire")
+		}
+	}
+	if !b.update(0.6, now.Add(time.Second)) {
 		t.Fatal("first onset should trigger")
 	}
-	if b.trig(0.5, now.Add(50*time.Millisecond)) {
+	if b.update(0.6, now.Add(time.Second+50*time.Millisecond)) {
 		t.Error("second onset within cooldown should not trigger")
 	}
-	// Hysteresis: a sustained loud section must not re-fire even after
-	// the cooldown; the signal has to dip first (debounce re-arm).
-	if b.trig(0.5, now.Add(200*time.Millisecond)) {
-		t.Error("sustained level must not re-fire without a dip")
-	}
-	// Dip near the average re-arms, then the next onset fires.
-	b.trig(0.05, now.Add(210*time.Millisecond))
-	if !b.trig(0.5, now.Add(400*time.Millisecond)) {
-		t.Error("onset after dip + cooldown should trigger")
+	if !b.update(0.6, now.Add(time.Second+200*time.Millisecond)) {
+		t.Error("onset after cooldown should trigger")
 	}
 }
 
 func TestBeatChatterSuppressed(t *testing.T) {
 	b := beatTracker{cooldown: 120 * time.Millisecond}
 	now := time.Now()
-	b.ema = 0.05
+	// Prime with quiet, then step to a loud sustained hover. The window
+	// turnover may flash a few times, but the stream must settle: no
+	// endless chatter, and steady state stays dark.
+	for i := 0; i < minBeatContext; i++ {
+		b.update(0.05, now.Add(time.Duration(i)*time.Second/60))
+	}
 	fires := 0
-	// Simulate a loud section hovering at the threshold for a full
-	// second: exactly one onset may fire, never a chatter stream.
-	for i := 0; i < 60; i++ {
+	steady := 0
+	for i := 0; i < 90; i++ {
 		lvl := 0.5
 		if i%2 == 0 {
 			lvl = 0.52
 		}
-		if b.trig(lvl, now.Add(time.Duration(i)*time.Second/60)) {
+		if b.update(lvl, now.Add(time.Duration(minBeatContext+i)*time.Second/60)) {
+			fires++
+			if i >= 60 {
+				steady++
+			}
+		}
+	}
+	if fires > 8 {
+		t.Errorf("hovering signal fired %d times, want a bounded burst", fires)
+	}
+	if steady != 0 {
+		t.Errorf("steady hover fired %d times, want 0", steady)
+	}
+}
+
+// kickTrain synthesizes a Tokyo-Drift-like bass signal: a heavy sustained
+// floor with a kick spike every period, plus low noise. Kicks decay fast
+// (~60ms) like a real transient.
+func kickTrain(dur, period, floor, kick float64, noise float64, seed int64) []float64 {
+	dt := 1.0 / 60.0
+	n := int(dur / dt)
+	out := make([]float64, n)
+	r := uint64(seed)
+	next := func() float64 {
+		r = r*6364136223846793005 + 1442695040888963407
+		return float64(r>>33) / (1 << 31)
+	}
+	for i := range out {
+		tt := float64(i) * dt
+		v := floor + (next()-0.5)*2*noise
+		if since := tt - float64(int(tt/period))*period; since < 0.3 {
+			v += kick * float64(int(1000*(1-since/0.3))) / 1000
+		}
+		if v < 0 {
+			v = 0
+		}
+		if v > 1 {
+			v = 1
+		}
+		out[i] = v
+	}
+	return out
+}
+
+func TestBeatKickTrain140BPM(t *testing.T) {
+	b := beatTracker{cooldown: 120 * time.Millisecond}
+	now := time.Now()
+	// 140 BPM four-on-the-floor over a heavy 0.45 floor: the case a
+	// fixed-ratio detector misses once its average adapts.
+	sig := kickTrain(4.0, 60.0/140.0, 0.45, 0.45, 0.02, 7)
+	var fires []int
+	for i, e := range sig {
+		if b.update(e, now.Add(time.Duration(i)*time.Second/60)) {
+			fires = append(fires, i)
+		}
+	}
+	if len(fires) < 7 || len(fires) > 12 {
+		t.Fatalf("140bpm train fired %d times, want ~9 (one per kick)", len(fires))
+	}
+	// Every fire must land within 100ms after a kick attack.
+	period := 60.0 / 140.0
+	for _, f := range fires {
+		tt := float64(f) / 60.0
+		if since := tt - float64(int(tt/period))*period; since > 0.1 {
+			t.Errorf("fire at %.3fs is %.3fs past the kick", tt, since)
+		}
+	}
+}
+
+func TestBeatFloorOnlySilent(t *testing.T) {
+	b := beatTracker{cooldown: 120 * time.Millisecond}
+	now := time.Now()
+	fires := 0
+	// Heavy floor, no kicks: the detector must stay quiet.
+	for i, e := range kickTrain(3.0, 60.0/140.0, 0.5, 0.0, 0.02, 3) {
+		if b.update(e, now.Add(time.Duration(i)*time.Second/60)) {
 			fires++
 		}
 	}
-	if fires != 1 {
-		t.Errorf("hovering signal fired %d times, want exactly 1", fires)
+	if fires != 0 {
+		t.Errorf("floor-only signal fired %d times, want 0", fires)
 	}
 }
 

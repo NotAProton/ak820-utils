@@ -408,7 +408,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Fold the frame into the shared spectrum the modes read.
 		deriveSpectrum(&m.spec, msg, dt)
-		if m.fx.beats.trig(m.spec.bass, now) {
+		// Beat detection reads instantaneous (unsmoothed) bass: smoothing
+		// blunts the transient edge a kick is. Bands 0-2 hold the left
+		// low end, bands 9-11 the right.
+		inst := float64(msg[0]+msg[1]+msg[2]+msg[numBands]+msg[numBands+1]+msg[numBands+2]) / 600
+		if m.fx.beats.update(inst, now) {
 			m.fx.noteBeat(now)
 			m.fx.ripples = append(m.fx.ripples,
 				ripple{start: now, amp: 0.55 + 0.45*m.spec.bass})

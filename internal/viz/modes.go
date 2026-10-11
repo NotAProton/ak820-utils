@@ -143,34 +143,77 @@ func smooth(cur, target, dt, attackRate, fallRate float64) float64 {
 	return cur + (target-cur)*minF(1, dt*rate)
 }
 
-// beatTracker triggers on bass onsets above a rolling average. It is a
-// Schmitt trigger: firing disarms it until the signal dips back near the
-// average, so a loud sustained section cannot chatter at the threshold and
-// strobe-like consumers cannot average out to a constant glow. The
-// cooldown is a backstop rate limit on top.
+// beatWindow is the onset context in frames (~0.7s at 60fps cava output:
+// long enough to span a full beat at dance tempos, short enough to track
+// section changes without a long hangover).
+const beatWindow = 43
+
+// minBeatContext is the frames needed before the detector arms (~200ms),
+// so startup transients never fire on an empty window.
+const minBeatContext = 12
+
+// beatTracker fires on bass onsets using instantaneous (unsmoothed) bass
+// energy against an adaptive threshold from the window mean and variance.
+// Dense sections raise the variance, which lowers the bar instead of
+// raising it, so kicks punch through a driving bassline that would defeat
+// a fixed-ratio-vs-average detector. Level-based hysteresis is gone: the
+// threshold rides the window, so hovering at a sustained level cannot
+// chatter and no dip-re-arm can starve dense music.
 type beatTracker struct {
-	ema      float64
+	hist     [beatWindow]float64 // ring of instantaneous bass energies
+	head     int
+	filled   int
 	last     time.Time
 	cooldown time.Duration
-	fired    bool // set on fire, cleared when bass dips to re-arm
 }
 
-// DefaultBeatCooldown is the production cooldown between ripple triggers.
+// DefaultBeatCooldown is the production backstop between beat fires.
 const DefaultBeatCooldown = 120 * time.Millisecond
 
-func (b *beatTracker) trig(bass float64, now time.Time) bool {
-	b.ema += (bass - b.ema) * 0.06
-	if b.fired {
-		// Re-arm only on a genuine dip: the cooldown alone cannot
-		// separate a sustained loud section from repeated onsets.
-		if bass < b.ema*1.15 {
-			b.fired = false
-		}
+// update folds one instantaneous bass energy sample (0..1, pre-smoothing)
+// and reports whether it opens a beat.
+func (b *beatTracker) update(e float64, now time.Time) bool {
+	if e < 0 {
+		e = 0
+	}
+	if e > 1 {
+		e = 1
+	}
+	b.hist[b.head%beatWindow] = e
+	b.head++
+	if b.filled < beatWindow {
+		b.filled++
+	}
+	if b.filled < minBeatContext {
 		return false
 	}
-	if bass > b.ema*1.4 && bass > 0.10 && now.Sub(b.last) > b.cooldown {
+	// Full-window statistics, deliberately untrimmed: kick spikes belong
+	// to the baseline, so marginal kicks keep firing. A hard step from
+	// quiet to loud may flash a few times while the window turns over,
+	// then goes quiet; real section changes carry their own onsets, so
+	// those flashes read as intentional.
+	var sum, sqSum float64
+	for i := 0; i < b.filled; i++ {
+		sum += b.hist[i]
+		sqSum += b.hist[i] * b.hist[i]
+	}
+	mean := sum / float64(b.filled)
+	variance := sqSum/float64(b.filled) - mean*mean
+	if variance < 0 {
+		variance = 0
+	}
+	// Dense music (high variance) lowers the bar; sparse music keeps it
+	// strict. Clamped so neither dead silence nor white noise can force
+	// or suppress fire on its own; the absolute gate owns silence.
+	c := 1.45 - 6*variance
+	if c < 1.15 {
+		c = 1.15
+	}
+	if c > 1.5 {
+		c = 1.5
+	}
+	if e > 0.12 && e > mean*c && now.Sub(b.last) > b.cooldown {
 		b.last = now
-		b.fired = true
 		return true
 	}
 	return false
