@@ -145,6 +145,87 @@ func TestBeatFloorOnlySilent(t *testing.T) {
 	}
 }
 
+func TestTempoConverges140(t *testing.T) {
+	b := beatTracker{cooldown: 120 * time.Millisecond}
+	now := time.Now()
+	sig := kickTrain(9.0, 60.0/140.0, 0.45, 0.45, 0.02, 11)
+	for i, e := range sig {
+		b.update(e, now.Add(time.Duration(i)*time.Second/60))
+	}
+	if !b.confident {
+		t.Fatal("tempo never became confident on a steady 140bpm train")
+	}
+	if b.bpm < 130 || b.bpm > 150 {
+		t.Errorf("tempo = %.1f bpm, want ~140", b.bpm)
+	}
+}
+
+// TestSteadySectionKeepsPulsing is the section-start regression: once the
+// onset gate adapts to a loud section, the tempo grid must carry the pulse
+// through the middle instead of going quiet until the next section.
+func TestSteadySectionKeepsPulsing(t *testing.T) {
+	b := beatTracker{cooldown: 120 * time.Millisecond}
+	now := time.Now()
+	sig := kickTrain(10.0, 60.0/140.0, 0.45, 0.45, 0.02, 21)
+	fires := 0
+	// Middle window: seconds 4-7, long past any startup transient.
+	// ~7 kicks live there; the grid must catch most of them.
+	for i, e := range sig {
+		tt := float64(i) / 60.0
+		if b.update(e, now.Add(time.Duration(i)*time.Second/60)) && tt >= 4 && tt < 7 {
+			fires++
+		}
+	}
+	if fires < 5 {
+		t.Errorf("steady middle fired %d times, want >= 5 of ~7 kicks", fires)
+	}
+}
+
+func TestPredictionStaysDarkInSilence(t *testing.T) {
+	b := beatTracker{cooldown: 120 * time.Millisecond}
+	now := time.Now()
+	// Prime tempo with 6s of kicks, then cut to near-silence: the grid
+	// must not hallucinate beats into the breakdown.
+	sig := kickTrain(6.0, 60.0/140.0, 0.45, 0.45, 0.02, 31)
+	for i, e := range sig {
+		b.update(e, now.Add(time.Duration(i)*time.Second/60))
+	}
+	if !b.confident {
+		t.Fatal("tempo should be confident after 6s of kicks")
+	}
+	fires := 0
+	for i := 0; i < 180; i++ {
+		if b.update(0.03, now.Add(time.Duration(360+i)*time.Second/60)) {
+			fires++
+		}
+	}
+	if fires != 0 {
+		t.Errorf("silence fired %d times on a confident grid, want 0", fires)
+	}
+}
+
+// TestWeakKicksKeepPulsing covers kicks too small to cross the onset gate:
+// the tempo grid bootstraps from flux periodicity alone (phase anchored
+// to the strongest flux peak) and carries the section.
+func TestWeakKicksKeepPulsing(t *testing.T) {
+	b := beatTracker{cooldown: 120 * time.Millisecond}
+	now := time.Now()
+	sig := kickTrain(10.0, 60.0/140.0, 0.6, 0.2, 0.02, 41)
+	fires := 0
+	for i, e := range sig {
+		tt := float64(i) / 60.0
+		if b.update(e, now.Add(time.Duration(i)*time.Second/60)) && tt >= 4 && tt < 7 {
+			fires++
+		}
+	}
+	if !b.confident {
+		t.Fatal("tempo should lock onto periodic weak kicks")
+	}
+	if fires < 5 {
+		t.Errorf("weak-kick middle fired %d times, want >= 5 of ~7 kicks", fires)
+	}
+}
+
 func TestRippleRemoval(t *testing.T) {
 	m := &Model{}
 	m.fx.ripples = []ripple{{start: time.Now().Add(-2 * time.Second), amp: 0.8}}

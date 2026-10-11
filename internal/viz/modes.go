@@ -148,6 +148,21 @@ func smooth(cur, target, dt, attackRate, fallRate float64) float64 {
 // section changes without a long hangover).
 const beatWindow = 43
 
+// Tempo layer (Ellis-lite): the onset envelope is autocorrelated over a
+// multi-second window to estimate the period, and beats are predicted on
+// that grid so steady sections keep pulsing instead of going quiet once
+// the onset gate adapts. Lags cover 60-200 BPM at 60fps.
+const (
+	tempoWindow    = 240 // ~4s of onset envelope
+	tempoRecompute = 30  // frames between tempo estimates (~0.5s)
+	minTempoLag    = 18  // 200 BPM
+	maxTempoLag    = 60  // 60 BPM
+)
+
+// predictFloor is the instantaneous energy a predicted (non-onset) beat
+// needs: tempo may say "now", but silence stays dark.
+const predictFloor = 0.15
+
 // minBeatContext is the frames needed before the detector arms (~200ms),
 // so startup transients never fire on an empty window.
 const minBeatContext = 12
@@ -165,6 +180,15 @@ type beatTracker struct {
 	filled   int
 	last     time.Time
 	cooldown time.Duration
+
+	fluxRing  [tempoWindow]float64 // onset strength envelope ring
+	fluxHead  int
+	fluxFull  bool
+	prevLog   float64
+	sinceTpo  int
+	bpm       float64 // estimated tempo, 0 when unknown
+	confident bool
+	nextBeat  time.Time // predicted beat phase on the tempo grid
 }
 
 // DefaultBeatCooldown is the production backstop between beat fires.
@@ -183,6 +207,27 @@ func (b *beatTracker) update(e float64, now time.Time) bool {
 	b.head++
 	if b.filled < beatWindow {
 		b.filled++
+	}
+	// Onset strength envelope: log-compressed bass flux (Bello-style).
+	// Log compression keeps loud sections from dominating the tempo
+	// estimate the way linear energy would.
+	l := math.Log(1 + 9*e)
+	f := l - b.prevLog
+	if f < 0 {
+		f = 0
+	}
+	// Overwrite the ring slot: stale onset strength must age out as the
+	// window turns over, never accumulate.
+	b.fluxRing[b.fluxHead%tempoWindow] = f
+	b.prevLog = l
+	b.fluxHead++
+	if b.fluxHead >= tempoWindow {
+		b.fluxFull = true
+	}
+	b.sinceTpo++
+	if b.sinceTpo >= tempoRecompute && b.fluxFull {
+		b.sinceTpo = 0
+		b.estimateTempo(now)
 	}
 	if b.filled < minBeatContext {
 		return false
@@ -213,10 +258,183 @@ func (b *beatTracker) update(e float64, now time.Time) bool {
 		c = 1.5
 	}
 	if e > 0.12 && e > mean*c && now.Sub(b.last) > b.cooldown {
-		b.last = now
+		b.fire(now)
 		return true
 	}
+	// Tempo prediction carries steady sections: with a confident tempo,
+	// fire on the grid when audio is present even without an onset. The
+	// energy floor keeps breakdowns dark, and falling more than a period
+	// behind resyncs silently instead of machine-gunning catch-up beats.
+	if b.confident && b.bpm > 0 && !b.nextBeat.IsZero() && now.Sub(b.last) > b.cooldown {
+		period := time.Duration(60 / b.bpm * float64(time.Second))
+		if now.After(b.nextBeat.Add(period)) {
+			b.nextBeat = now.Add(period)
+			return false
+		}
+		if !now.Before(b.nextBeat) && e > predictFloor {
+			b.nextBeat = b.nextBeat.Add(period)
+			b.fire(now)
+			return true
+		}
+	}
 	return false
+}
+
+// estimateTempo runs an Ellis-style tempo estimate: autocorrelate the
+// onset envelope over the tempo window and pick the lag in the musical
+// range with continuity and center priors. Octave ambiguity is harmless
+// here: half- and double-time both land on the grid for lights.
+func (b *beatTracker) estimateTempo(now time.Time) {
+	// Mean-removed envelope in time order.
+	var xs [tempoWindow]float64
+	var mean float64
+	for i := 0; i < tempoWindow; i++ {
+		xs[i] = b.fluxRing[(b.fluxHead-tempoWindow+i)%tempoWindow]
+		mean += xs[i]
+	}
+	mean /= tempoWindow
+	for i := range xs {
+		xs[i] -= mean
+	}
+	var total float64
+	for _, v := range xs {
+		total += v * v
+	}
+	if total <= 0 {
+		b.confident = false
+		return
+	}
+	curLag := 0
+	if b.bpm > 0 {
+		curLag = int(3600 / b.bpm) // period frames at 60fps
+	}
+	bestLag, bestScore, sumScore := 0, -1.0, 0.0
+	var raw [maxTempoLag + 1]float64
+	for lag := minTempoLag; lag <= maxTempoLag; lag++ {
+		var acc float64
+		for i := lag; i < tempoWindow; i++ {
+			acc += xs[i] * xs[i-lag]
+		}
+		acc /= float64(tempoWindow - lag)
+		raw[lag] = acc
+		sumScore += acc
+		if score := acc * priorWeight(lag, curLag); score > bestScore {
+			bestScore, bestLag = score, lag
+		}
+	}
+	// Confidence: a real pulse stands clearly above the lag average.
+	// Deliberately not gated on onset fires: weak kicks that never cross
+	// the energy gate still imprint periodicity on the flux envelope, and
+	// requiring fires would leave the grid dead exactly when steady
+	// sections need it. Breakdown discipline comes from the prediction
+	// energy floor, not from confidence.
+	if bestScore <= 0 {
+		b.confident = false
+		return
+	}
+	peakRatio := bestScore / (sumScore / float64(maxTempoLag-minTempoLag+1))
+	if peakRatio < 1.4 {
+		b.confident = false
+		return
+	}
+	was := b.confident
+	b.confident = true
+	// Parabolic interpolation around the autocorrelation peak: the lag
+	// grid is coarse (140 BPM falls between bins), and sub-bin accuracy
+	// keeps the predicted grid from drifting over long sections.
+	lagFloat := float64(bestLag)
+	if bestLag > minTempoLag && bestLag < maxTempoLag {
+		a, bb, cc := raw[bestLag-1], raw[bestLag], raw[bestLag+1]
+		if denom := a - 2*bb + cc; denom < 0 {
+			if off := 0.5 * (a - cc) / denom; off > -1 && off < 1 {
+				lagFloat += off
+			}
+		}
+	}
+	newBPM := 3600 / lagFloat
+	if b.bpm <= 0 {
+		b.bpm = newBPM
+	} else if absF(newBPM-b.bpm)/b.bpm > 0.2 {
+		// Genuine tempo change: jump and re-base the grid.
+		b.bpm = newBPM
+		if !b.last.IsZero() {
+			b.nextBeat = b.last.Add(time.Duration(60 / b.bpm * float64(time.Second)))
+		}
+	} else {
+		b.bpm += (newBPM - b.bpm) * 0.15
+	}
+	// Phase bootstrap: without any onset fire there is no phase anchor,
+	// so take it from the strongest recent flux peak instead. Without
+	// this, confident tempo with sub-gate kicks would still never flash.
+	if !was || b.nextBeat.IsZero() || now.After(b.nextBeat.Add(2*time.Duration(60/b.bpm*float64(time.Second)))) {
+		b.anchorPhase(now)
+	}
+}
+
+// anchorPhase sets the predicted grid from the strongest flux peak in the
+// last two periods, projected forward to the first beat at or after now.
+func (b *beatTracker) anchorPhase(now time.Time) {
+	period := 60 / b.bpm
+	span := int(2 * period * 60)
+	if span > tempoWindow {
+		span = tempoWindow
+	}
+	if span < 2 {
+		return
+	}
+	best, bestV := 0, -1.0
+	for i := 0; i < span; i++ {
+		if v := b.fluxRing[(b.fluxHead-1-i+tempoWindow*2)%tempoWindow]; v > bestV {
+			best, bestV = i, v
+		}
+	}
+	if bestV <= 0 {
+		return
+	}
+	peakAgo := time.Duration(float64(best) / 60 * float64(time.Second))
+	peakTime := now.Add(-peakAgo)
+	k := int(peakAgo.Seconds()/period) + 1
+	b.nextBeat = peakTime.Add(time.Duration(float64(k) * period * float64(time.Second)))
+}
+
+// priorWeight holds the continuity and center priors for a lag: trust
+// the current tempo unless the evidence clearly moved, with a mild pull
+// toward dance tempos.
+func priorWeight(lag, curLag int) float64 {
+	w := 1.0
+	if curLag > 0 {
+		if d := absI(lag - curLag); d < 6 {
+			w *= 1 + 0.4*(1-float64(d)/6)
+		}
+	}
+	if bpm := 3600 / float64(lag); bpm > 110 && bpm < 150 {
+		w *= 1.1
+	}
+	return w
+}
+
+func absI(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func absF(v float64) float64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// fire records a beat for cooldown, tempo confidence, and phase state.
+// Every fire re-bases the predicted grid: kicks (even syncopated ones)
+// are valid phase references for lights.
+func (b *beatTracker) fire(now time.Time) {
+	b.last = now
+	if b.bpm > 0 {
+		b.nextBeat = now.Add(time.Duration(60 / b.bpm * float64(time.Second)))
+	}
 }
 
 // spring follows a target with fast attack and slower release.
