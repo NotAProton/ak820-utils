@@ -4,11 +4,13 @@
 package viz
 
 import (
+	"bufio"
 	"fmt"
 	"math/rand"
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -159,7 +161,21 @@ func (m *Model) startCava() error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(cfg, "input = pulse\nmethod = pulse\nchannels = mono\nbars = %d\nsamplerate = 44100\nascii_max_range = 100\nframerate = 60\n", numBars)
+	fmt.Fprintf(cfg, `[general]
+bars = %d
+framerate = 60
+
+[input]
+method = pulse
+source = @DEFAULT_MONITOR@
+channels = mono
+
+[output]
+method = raw
+raw_target = /dev/stdout
+data_format = ascii
+ascii_max_range = 100
+`, numBars)
 	cfg.Close()
 
 	cmd := exec.Command("cava", "-p", cfg.Name())
@@ -172,31 +188,44 @@ func (m *Model) startCava() error {
 	}
 	m.cava = cmd
 	go func() {
-		buf := make([]byte, numBars)
-		for {
-			n, err := stdout.Read(buf)
-			if err != nil {
-				return
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			parts := strings.Split(strings.TrimRight(scanner.Text(), ";"), ";")
+			if len(parts) != numBars {
+				continue
 			}
-			if n == numBars {
-				msg := make(cavaMsg, numBars)
-				for i := 0; i < numBars; i++ {
-					msg[i] = int(buf[i])
+			msg := make(cavaMsg, numBars)
+			for i, p := range parts {
+				v, err := strconv.Atoi(p)
+				if err != nil {
+					continue
 				}
-				select {
-				case m.raw <- msg:
-				case <-m.quit:
-					return
-				}
+				msg[i] = v
+			}
+			select {
+			case m.raw <- msg:
+			case <-m.quit:
+				return
 			}
 		}
 	}()
 	return nil
 }
 
-// Init kicks off the render loop.
+// Init kicks off the render loop and the cava subscription.
 func (m Model) Init() tea.Cmd {
-	return m.tick()
+	return tea.Batch(m.tick(), m.listenCava())
+}
+
+// listenCava forwards the next spectrum read into the program.
+func (m Model) listenCava() tea.Cmd {
+	return func() tea.Msg {
+		msg, ok := <-m.raw
+		if !ok {
+			return nil
+		}
+		return msg
+	}
 }
 
 func (m Model) tick() tea.Cmd {
@@ -230,7 +259,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.paintKeyboard()
-		return m, nil
+		return m, m.listenCava()
 	case tickMsg:
 		return m, m.tick()
 	case tea.KeyMsg:
@@ -252,7 +281,7 @@ func (m *Model) paintKeyboard() {
 		pk := m.peaks[c.bar]
 		height := float64(numRows-1-c.row) / float64(numRows-1)
 		switch {
-		case height <= lvl:
+		case lvl > 0.01 && height <= lvl:
 			r, g, b := gradRGB(t.keyGrad, lvl)
 			m.kb.SetSlot(c.slot, r, g, b)
 		case abs(height-pk) < 0.14 && pk > 0.15:
@@ -302,7 +331,7 @@ func (m Model) View() string {
 			lvl := m.bars[bar]
 			pk := m.peaks[bar]
 			switch {
-			case threshold <= lvl:
+			case lvl > 0.01 && threshold <= lvl:
 				line.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(t.colors[colorIndex(lvl)])).Render("██"))
 			case abs(threshold-pk) < 0.14 && pk > 0.15:
 				line.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(t.peakColor)).Render("──"))
