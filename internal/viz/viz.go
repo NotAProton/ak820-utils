@@ -498,6 +498,8 @@ func (m *Model) paintKeyboard(now time.Time, dt float64) {
 			rgb = m.paintPlasma(c, t, now, &m.spec)
 		case modeWings:
 			rgb = m.paintWings(c, t, dt, &m.spec)
+		case modeStrobe:
+			rgb = m.paintStrobe(c, t, now, &m.spec)
 		default:
 			rgb = m.paintRipple(c, t, now, &m.spec)
 		}
@@ -634,6 +636,9 @@ func (m Model) View() string {
 		"\n\nTHEMES\n" + strings.Join(themeLines, "\n") +
 		"\n\nACCENT " + accentState(m.fx.accentOn) +
 		"\nLEVEL " + fgStyle(string(ui.ColorRainbowGreen)).Render(lvlBar)
+	if modeIx == modeStrobe {
+		sideBody += "\n" + ui.StyleMiss.Render("⚠ strobe: photosensitivity caution")
+	}
 	if m.spec.quietFor >= 2 {
 		sideBody += "\n" + ui.StyleDim.Render("✧ idle drift — play audio")
 	}

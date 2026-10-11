@@ -28,6 +28,9 @@ flows through the `ak820` binary: key geometry comes from
     while the level picks the brightness. Mids rotate the hue.
   - **wings** — a bass comet: a bright front expands toward Esc and Enter
     with a fading tail; onsets add a leading-edge kick.
+  - **strobe** — the whole board snaps from near-black to full-bright
+    synthwave on every bass beat, stepping pink → purple → cyan → red →
+    yellow per hit. Photosensitivity caution applies.
 
   Themes: synthwave, ocean, fire (`t` cycles). The terminal uses rounded
   cards, rainbow ribbons, and pills, and adapts to narrow windows.

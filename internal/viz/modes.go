@@ -13,10 +13,11 @@ const (
 	modeBloom
 	modePlasma
 	modeWings
+	modeStrobe
 	numModes
 )
 
-var modeNames = [...]string{"ripple", "bars", "bloom", "plasma", "wings"}
+var modeNames = [...]string{"ripple", "bars", "bloom", "plasma", "wings", "strobe"}
 
 // kbAspect is the keyboard's physical width-to-height ratio; multiplying
 // normalized x by it keeps radial effects circular on the board.
@@ -512,7 +513,51 @@ func (m *Model) paintPlasma(c keyCell, t theme, now time.Time, sp *spectrum) [3]
 	return [3]byte{r, g, b}
 }
 
-// paintWings renders a bass comet: a bright front expands from the center
+// strobePalette is the fixed synthwave rotation for strobe mode: hot
+// pink, purple, cyan, warning red, and pale yellow.
+var strobePalette = [][3]byte{
+	{255, 119, 169},
+	{186, 119, 255},
+	{59, 201, 255},
+	{255, 89, 131},
+	{255, 234, 108},
+}
+
+// strobeHold is how long the board stays full-bright after an onset before
+// the hard cut back to near-black.
+const strobeHold = 0.08 // seconds
+
+// paintStrobe flashes the whole board in synthwave on every bass beat: a
+// hard snap from near-black to full-bright, a short hold, then a hard cut.
+// The color steps through the synthwave palette per beat. Between beats the
+// board sits near-black with a faint bass glow; in silence it breathes dim
+// instead of strobing.
+func (m *Model) paintStrobe(c keyCell, t theme, now time.Time, sp *spectrum) [3]byte {
+	_ = t
+	_ = c
+	tt := now.Sub(m.startT).Seconds()
+	if sp.quietFor >= 2 {
+		k := 0.5 + 0.5*math.Sin(tt*3.14159)
+		v := 0.05 + 0.08*k
+		r, g, b := hsvRGB(0.88+0.06*k, 0.8, v)
+		return [3]byte{r, g, b}
+	}
+	age := tt
+	if !m.fx.lastBeat.IsZero() {
+		age = now.Sub(m.fx.lastBeat).Seconds()
+		if age < 0 {
+			age = 0
+		}
+	}
+	if age < strobeHold {
+		pal := strobePalette[m.fx.beatCount%uint64(len(strobePalette))]
+		return [3]byte{pal[0], pal[1], pal[2]}
+	}
+	ag := sp.gain()
+	floor := 0.015 + 0.06*minF(1, sp.bass*ag)
+	return [3]byte{byte(floor * 255), byte(floor * 60), byte(floor * 120)}
+}
+
 // toward Esc and Enter with an asymmetric trailing tail. Treble adds a
 // faint leading-edge shimmer.
 func (m *Model) paintWings(c keyCell, t theme, dt float64, sp *spectrum) [3]byte {

@@ -224,6 +224,43 @@ func TestAccentToggleKey(t *testing.T) {
 	}
 }
 
+func TestStrobeSnap(t *testing.T) {
+	m := &Model{startT: time.Now()}
+	now := time.Now()
+	hot := &spectrum{bass: 0.8, overall: 0.7}
+	hot.agc = 0.45
+	c := keyCell{slot: 3, row: 2, x: 0.3, y: 0.4, px: 0.3 * kbAspect, py: 0.4}
+	c2 := keyCell{slot: 40, row: 4, x: 0.6, y: 0.8, px: 0.6 * kbAspect, py: 0.8}
+
+	m.fx.noteBeat(now)
+	on := m.paintStrobe(c, themes[0], now.Add(10*time.Millisecond), hot)
+	lum := int(on[0]) + int(on[1]) + int(on[2])
+	if lum < 400 {
+		t.Errorf("strobe hold must be full-bright, lum %d rgb %v", lum, on)
+	}
+	// Whole board flashes together: every key shows the same color.
+	if other := m.paintStrobe(c2, themes[0], now.Add(10*time.Millisecond), hot); other != on {
+		t.Errorf("strobe must be uniform, got %v vs %v", other, on)
+	}
+	// After the hold comes the hard cut to near-black.
+	off := m.paintStrobe(c, themes[0], now.Add(500*time.Millisecond), hot)
+	if offLum := int(off[0]) + int(off[1]) + int(off[2]); offLum > 80 {
+		t.Errorf("strobe off-window must sit near-black, lum %d", offLum)
+	}
+	// Next beat steps the palette.
+	m.fx.noteBeat(now.Add(500 * time.Millisecond))
+	next := m.paintStrobe(c, themes[0], now.Add(510*time.Millisecond), hot)
+	if next == on {
+		t.Error("strobe color must step per beat")
+	}
+	// Silence breathes dim instead of strobing.
+	quiet := &spectrum{quietFor: 30}
+	q := m.paintStrobe(c, themes[0], now, quiet)
+	if qLum := int(q[0]) + int(q[1]) + int(q[2]); qLum == 0 || qLum > 120 {
+		t.Errorf("idle strobe lum %d out of dim range", qLum)
+	}
+}
+
 func TestDeriveParallelIndependent(t *testing.T) {
 	raw := make([]int, numBars)
 	for i := range raw {
