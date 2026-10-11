@@ -117,13 +117,14 @@ type Model struct {
 	cells   []keyCell
 	themeIx int
 
-	bars   []float64
-	peaks  []float64
-	raw    chan cavaMsg
-	cava   *exec.Cmd
-	quit   chan struct{}
-	rng    *rand.Rand
-	errMsg string
+	bars      []float64
+	peaks     []float64
+	raw       chan cavaMsg
+	cava      *exec.Cmd
+	quit      chan struct{}
+	rng       *rand.Rand
+	errMsg    string
+	lastFrame time.Time
 }
 
 // New builds the model and starts cava.
@@ -158,7 +159,7 @@ func (m *Model) startCava() error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(cfg, "input = pulse\nmethod = pulse\nchannels = mono\nbars = %d\nsamplerate = 44100\nascii_max_range = 100\n", numBars)
+	fmt.Fprintf(cfg, "input = pulse\nmethod = pulse\nchannels = mono\nbars = %d\nsamplerate = 44100\nascii_max_range = 100\nframerate = 60\n", numBars)
 	cfg.Close()
 
 	cmd := exec.Command("cava", "-p", cfg.Name())
@@ -199,24 +200,33 @@ func (m Model) Init() tea.Cmd {
 }
 
 func (m Model) tick() tea.Cmd {
-	return tea.Tick(time.Second/30, func(time.Time) tea.Msg { return tickMsg(time.Now()) })
+	return tea.Tick(time.Second/60, func(time.Time) tea.Msg { return tickMsg(time.Now()) })
 }
 
 // Update consumes bars and renders.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case cavaMsg:
+		now := time.Now()
+		dt := now.Sub(m.lastFrame).Seconds()
+		if dt <= 0 || dt > 0.5 {
+			dt = 1.0 / 60.0
+		}
+		m.lastFrame = now
+		// Frame-rate-independent attack/decay.
+		attack := minF(1.0, dt*25)
+		fall := minF(1.0, dt*18)
 		for i, v := range msg {
 			lvl := float64(v) / 100.0
 			if lvl > m.bars[i] {
-				m.bars[i] += (lvl - m.bars[i]) * 0.5
+				m.bars[i] += (lvl - m.bars[i]) * attack
 			} else {
-				m.bars[i] += (lvl - m.bars[i]) * 0.35
+				m.bars[i] += (lvl - m.bars[i]) * fall
 			}
 			if m.bars[i] > m.peaks[i] {
 				m.peaks[i] = m.bars[i]
 			} else {
-				m.peaks[i] -= 0.015
+				m.peaks[i] -= 0.45 * dt
 			}
 		}
 		m.paintKeyboard()
@@ -319,6 +329,13 @@ func colorIndex(lvl float64) int {
 
 func dimStyle() lipgloss.Style {
 	return lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+}
+
+func minF(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func abs(x float64) float64 {
