@@ -15,7 +15,7 @@ This repository is a pure consumer of the ak820 core binary. It must not
 open HID devices or encode protocol knowledge:
 
 - key geometry: `ak820 agent-context` (`per_key` section)
-- lighting transport: `ak820 pipe --yes` (stdin lines: `<cmd-hex> <payload-hex>`)
+- per-key transport: `ak820 pipe --yes` (stdin lines: `<cmd-hex> <payload-hex>`, frame addresses from `per_key`)
 - mode changes / restore: `ak820 set mode ...`
 
 The core module (github.com/NotAProton/ak820-go-drivers) is the single source

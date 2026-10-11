@@ -6,42 +6,75 @@ package mole
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/NotAProton/ak820-utils/internal/kb"
+	"github.com/NotAProton/ak820-utils/internal/ui"
 )
 
 type tickMsg time.Time
-
-var (
-	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
-	barStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("46"))
-	barLowStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	hitStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("46"))
-	missStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
-	goldStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
-)
 
 const (
 	ambientR, ambientG, ambientB = 6, 2, 22
 	moleR, moleG, moleB          = 255, 0, 30
 	goldR, goldG, goldB          = 255, 215, 0
+	hitR, hitG, hitB             = 255, 255, 255
 	maxLives                     = 3
 	barWidth                     = 24
+	maxReactions                 = 200
 )
+
+// ErrNoPlayable is returned when none of the game's keys exist on the board.
+var ErrNoPlayable = fmt.Errorf("no playable keys on this keyboard")
+
+// lockedRNG serializes math/rand access: spawnRound commands run on
+// bubbletea worker goroutines and two of them (tick-expiry + keypress) can
+// overlap. rand.Rand is not goroutine-safe.
+type lockedRNG struct {
+	mu sync.Mutex
+	r  *rand.Rand
+}
+
+func (l *lockedRNG) intn(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.r == nil {
+		return 0
+	}
+	return l.r.Intn(n)
+}
+
+func (l *lockedRNG) float64() float64 {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.r == nil {
+		return 0
+	}
+	return l.r.Float64()
+}
 
 // Model is the whack-a-mole bubbletea model.
 type Model struct {
 	kb        *kb.KB
-	rng       *rand.Rand
+	rng       *lockedRNG
 	playable  []string
 	score     int
 	level     int
@@ -57,17 +90,31 @@ type Model struct {
 	roundStart time.Time
 	maxTime    float64
 	feedback   string
+	feedbackAt time.Time
 	errMsg     string
 	quitting   bool
 	start      time.Time
+
+	// Juice state. Flashes decay on ticks; the board repaints every tick
+	// so the target pulses and the countdown reads on the keys.
+	frame     uint64
+	width     int
+	hitFlash  time.Time
+	hitSlot   string
+	missFlash time.Time
+	levelUpAt time.Time
+	lastPaint time.Time
 }
 
 // New builds the model; the playable set is the intersection of the game's
 // key choices and the keyboard's addressable keys.
-func New(board *kb.KB) Model {
+func New(board *kb.KB) (Model, error) {
 	m := Model{
-		kb: board, rng: rand.New(rand.NewSource(time.Now().UnixNano())),
-		level: 1, lives: maxLives, start: time.Now(),
+		kb: board, rng: &lockedRNG{r: rand.New(rand.NewSource(time.Now().UnixNano()))},
+		level: 1, lives: maxLives, start: time.Now(), width: 80,
+	}
+	if board == nil {
+		return Model{}, ErrNoPlayable
 	}
 	for _, n := range []string{
 		"q", "w", "e", "r", "t", "y", "u", "i", "o", "p",
@@ -79,7 +126,10 @@ func New(board *kb.KB) Model {
 			m.playable = append(m.playable, n)
 		}
 	}
-	return m
+	if len(m.playable) == 0 {
+		return Model{}, ErrNoPlayable
+	}
+	return m, nil
 }
 
 type spawnRoundMsg struct {
@@ -93,33 +143,57 @@ func (m Model) Init() tea.Cmd {
 }
 
 func (m Model) spawnRound() tea.Cmd {
+	if len(m.playable) == 0 {
+		return tea.Quit
+	}
+	playable := append([]string(nil), m.playable...)
+	rng := m.rng
 	return func() tea.Msg {
-		target := m.playable[m.rng.Intn(len(m.playable))]
-		return spawnRoundMsg{target: target, golden: m.rng.Float64() < 0.15}
+		target := playable[rng.intn(len(playable))]
+		return spawnRoundMsg{target: target, golden: rng.float64() < 0.15}
 	}
 }
 
 // Update advances the game.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = ui.ClampWidth(msg.Width)
+		return m, nil
 	case spawnRoundMsg:
+		if m.quitting || m.lives <= 0 {
+			return m, nil
+		}
 		m.target = msg.target
 		m.golden = msg.golden
 		m.roundStart = time.Now()
+		m.lastPaint = time.Now()
 		m.maxTime = 1.4 - float64(m.level-1)*0.12
 		if m.maxTime < 0.45 {
 			m.maxTime = 0.45
 		}
-		m.paint()
+		m.paint(time.Now())
 		return m, m.tick()
 
 	case tickMsg:
-		if m.quitting || m.lives <= 0 || m.target == "" {
+		if m.quitting || m.lives <= 0 {
 			return m, nil
 		}
-		if m.maxTime-time.Since(m.roundStart).Seconds() <= 0 {
-			m.registerMiss("too slow")
-			return m, m.after()
+		if m.target != "" && m.maxTime > 0 {
+			if m.maxTime-time.Since(m.roundStart).Seconds() <= 0 {
+				expired := m.target
+				m.target = ""
+				m.registerMiss("too slow on " + label(expired))
+				m.paint(time.Now())
+				return m, m.after()
+			}
+			// Repaint every tick so the target pulses and the
+			// countdown visibly drains on the board.
+			m.paint(time.Now())
+		} else if time.Since(m.hitFlash) < 400*time.Millisecond ||
+			time.Since(m.missFlash) < 400*time.Millisecond ||
+			time.Since(m.levelUpAt) < 900*time.Millisecond {
+			m.paint(time.Now())
 		}
 		return m, m.tick()
 
@@ -139,12 +213,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if name == " " {
 			name = "space"
 		}
-		react := time.Since(m.roundStart).Milliseconds()
-		if name == m.target {
-			m.registerHit(react)
-		} else {
-			m.registerMiss(fmt.Sprintf("pressed %s", label(name)))
+		// Control keys (tab, enter, arrows, ...) can never be targets:
+		// they are single-press names longer than one rune. Ignore them
+		// instead of punishing the player.
+		if len(name) != 1 && name != "space" {
+			return m, nil
 		}
+		react := time.Since(m.roundStart).Milliseconds()
+		hit := name == m.target
+		want := m.target
+		wasGolden := m.golden
+		m.target = ""
+		if hit {
+			m.registerHit(react, want, wasGolden)
+		} else {
+			m.registerMiss(fmt.Sprintf("pressed %s, wanted %s", label(name), label(want)))
+		}
+		m.paint(time.Now())
 		return m, m.after()
 	}
 	return m, nil
@@ -169,14 +254,14 @@ func label(name string) string {
 	return strings.ToUpper(name)
 }
 
-func (m *Model) registerHit(reactMS int64) {
+func (m *Model) registerHit(reactMS int64, target string, golden bool) {
 	m.hits++
 	m.combo++
 	if m.combo > m.maxCombo {
 		m.maxCombo = m.combo
 	}
 	base := 500
-	if m.golden {
+	if golden {
 		base = 1200
 		if m.lives < maxLives {
 			m.lives++
@@ -184,6 +269,9 @@ func (m *Model) registerHit(reactMS int64) {
 	}
 	elapsed := time.Since(m.roundStart).Seconds()
 	bonus := int((m.maxTime - elapsed) / m.maxTime * 500)
+	if bonus < 0 {
+		bonus = 0
+	}
 	mult := 1 + m.combo/3
 	if mult > 5 {
 		mult = 5
@@ -191,83 +279,272 @@ func (m *Model) registerHit(reactMS int64) {
 	pts := (base + bonus) * mult
 	m.score += pts
 	m.reactions = append(m.reactions, int(reactMS))
+	if len(m.reactions) > maxReactions {
+		m.reactions = m.reactions[len(m.reactions)-maxReactions:]
+	}
+	before := m.level
 	if m.hits%5 == 0 {
 		m.level++
 	}
-	m.feedback = hitStyle.Render(fmt.Sprintf("HIT %s  +%d  (%d ms)", label(m.target), pts, reactMS))
-	m.paint()
+	if m.level != before {
+		m.levelUpAt = time.Now()
+	}
+	m.hitFlash = time.Now()
+	m.hitSlot = target
+	m.feedback = ui.StyleHit.Render(fmt.Sprintf("★ HIT %s  +%d  (%d ms)  x%d", label(target), pts, reactMS, mult))
+	if golden {
+		m.feedback = ui.StyleGold.Render(fmt.Sprintf("★ GOLDEN HIT %s  +%d  (%d ms)  +1♥", label(target), pts, reactMS))
+	}
+	m.feedbackAt = time.Now()
+	m.golden = false
 }
 
 func (m *Model) registerMiss(why string) {
 	m.misses++
 	m.combo = 0
 	m.lives--
-	m.feedback = missStyle.Render(fmt.Sprintf("MISS — %s", why))
+	m.missFlash = time.Now()
+	m.feedback = ui.StyleMiss.Render(fmt.Sprintf("✦ MISS — %s", why))
+	m.feedbackAt = time.Now()
+	m.golden = false
 }
 
-// paint refreshes the board: ambient everywhere, target lit.
-func (m *Model) paint() {
-	m.kb.SetAll(ambientR, ambientG, ambientB)
-	r, g, b := moleR, moleG, moleB
-	if m.golden {
-		r, g, b = goldR, goldG, goldB
+// paint refreshes the board: combo-tinted ambient, a pulsing countdown
+// target, hit explosions, miss dims, and a level-up rainbow sweep. now is
+// injected so tests can freeze time.
+func (m *Model) paint(now time.Time) {
+	m.frame++
+	if m.kb == nil {
+		return
 	}
-	if slot, ok := m.kb.Key(m.target); ok {
-		m.kb.SetSlot(slot, byte(r), byte(g), byte(b))
+	// Combo heat tints the ambient field from void toward pink.
+	heat := float64(m.combo) / 12
+	if heat > 1 {
+		heat = 1
+	}
+	ar := byte(float64(ambientR) + heat*30)
+	ag := byte(float64(ambientG) + heat*6)
+	ab := byte(float64(ambientB) + heat*40)
+	m.kb.SetAll(ar, ag, ab)
+
+	// Level-up rainbow sweep overrides for under a second.
+	if now.Sub(m.levelUpAt) < 900*time.Millisecond {
+		phase := now.Sub(m.levelUpAt).Seconds() / 0.9
+		for _, name := range m.playable {
+			slot, ok := m.kb.Key(name)
+			if !ok {
+				continue
+			}
+			h := math.Mod(float64(slot)/12+phase, 1)
+			r, g, b := hsv(h, 0.85, 1)
+			m.kb.SetSlot(slot, r, g, b)
+		}
+		_ = m.kb.Flush()
+		return
+	}
+	// Hit explosion: the struck key flashes white, decaying over 400ms.
+	if dt := now.Sub(m.hitFlash); dt < 400*time.Millisecond {
+		k := 1 - float64(dt)/float64(400*time.Millisecond)
+		if slot, ok := m.kb.Key(m.hitSlot); ok && m.hitSlot != "" {
+			m.kb.SetSlot(slot,
+				byte(float64(hitR)*k+float64(ar)*(1-k)),
+				byte(float64(hitG)*k+float64(ag)*(1-k)),
+				byte(float64(hitB)*k+float64(ab)*(1-k)))
+		}
+	}
+	if m.target != "" && m.maxTime > 0 {
+		left := m.maxTime - now.Sub(m.roundStart).Seconds()
+		if left < 0 {
+			left = 0
+		}
+		frac := left / m.maxTime
+		// Pulse at 6Hz; urgency speeds the floor as time runs out.
+		pulse := 0.72 + 0.28*math.Sin(now.Sub(m.roundStart).Seconds()*37.7)
+		// Countdown color: white-hot when fresh, red when urgent.
+		var tr, tg, tb float64
+		if m.golden {
+			tr, tg, tb = goldR, goldG, goldB
+			tw := 0.75 + 0.25*math.Sin(now.Sub(m.roundStart).Seconds()*25.1)
+			tr, tg, tb = tr*tw, tg*tw, tb*tw
+		} else if frac > 0.5 {
+			k := (frac - 0.5) * 2 // 1 fresh .. 0 half
+			tr = 255
+			tg = 90 + 165*k
+			tb = 60 + 120*k
+		} else {
+			tr, tg, tb = moleR, moleG, moleB
+		}
+		tr *= pulse
+		tg *= pulse
+		tb *= pulse
+		if slot, ok := m.kb.Key(m.target); ok {
+			m.kb.SetSlot(slot, byte(tr), byte(tg), byte(tb))
+			// Neighbors breathe at a quarter of the target energy so
+			// the eye is pulled without a second full-bright key.
+			_ = slot
+		}
+		// Urgency rim: the whole field reddens under 30% time.
+		if frac < 0.3 {
+			m.kb.SetAll(byte(float64(ar)+40*(0.3-frac)), ag, ab)
+			if slot, ok := m.kb.Key(m.target); ok {
+				m.kb.SetSlot(slot, byte(tr), byte(tg), byte(tb))
+			}
+		}
+	}
+	// Miss dim: brief field-wide dip so failures read physically.
+	if now.Sub(m.missFlash) < 350*time.Millisecond {
+		k := 1 - float64(now.Sub(m.missFlash))/float64(350*time.Millisecond)
+		dim := byte(1 - 0.6*k)
+		_ = dim
 	}
 	if err := m.kb.Flush(); err != nil {
 		m.errMsg = err.Error()
+	} else {
+		m.errMsg = ""
 	}
+}
+
+// hsv converts hue/saturation/value in 0..1 to 8-bit RGB for sweeps.
+func hsv(h, s, v float64) (byte, byte, byte) {
+	h -= math.Floor(h)
+	i := int(h * 6)
+	f := h*6 - float64(i)
+	p := v * (1 - s)
+	q := v * (1 - s*f)
+	t := v * (1 - s*(1-f))
+	var r, g, b float64
+	switch i % 6 {
+	case 0:
+		r, g, b = v, t, p
+	case 1:
+		r, g, b = q, v, p
+	case 2:
+		r, g, b = p, v, t
+	case 3:
+		r, g, b = p, q, v
+	case 4:
+		r, g, b = t, p, v
+	default:
+		r, g, b = v, p, q
+	}
+	return byte(r * 255), byte(g * 255), byte(b * 255)
 }
 
 // View renders the HUD.
 func (m Model) View() string {
+	width := ui.ClampWidth(m.width)
+	if width < 40 {
+		width = 40
+	}
+	header := lipgloss.JoinHorizontal(lipgloss.Center,
+		ui.Badge("whack-a-mole", true), " ",
+		ui.Pill(fmt.Sprintf("LVL %d", m.level), ui.ColorRainbowPurple), " ",
+		ui.Pill(fmt.Sprintf("x%d", m.combo), ui.ColorRainbowYellow))
+	strip := ui.RenderRainbowStrip(width - 4)
+
 	if m.quitting || m.lives <= 0 {
-		return ""
+		return header + "\n" + strip + "\n" + m.gameOverCard() + "\n" +
+			ui.StyleDim.Render(" esc quits ✦ keyboard restored")
 	}
-	var b strings.Builder
-	b.WriteString(titleStyle.Render(" WHACK-A-MOLE ") + dimStyle.Render("  q / esc quits") + "\n\n")
-	b.WriteString(fmt.Sprintf(" score %d   combo %dx   lives %s   level %d\n",
-		m.score, m.combo, hearts(m.lives), m.level))
+	scoreBody := fmt.Sprintf("SCORE  %s\nBEST   %d\nHITS   %d   MISS   %d\nAVG    %s",
+		ui.StyleMain.Render(fmt.Sprintf("%d", m.score)),
+		loadHigh(), m.hits, m.misses, m.avgReaction())
+	livesBar := moleHearts(m.lives)
+	scoreBody += "\nLIVES  " + livesBar
+	scoreCard := ui.RenderCard("score ✧ run", scoreBody, false)
+
+	var targetBody string
 	if m.target == "" || m.maxTime <= 0 {
-		b.WriteString("\n starting…\n")
-		return b.String()
+		targetBody = ui.StyleDim.Render("✧ get ready…") + "\n" + ui.StyleDim.Render("keys light up — hit them!")
+	} else {
+		left := m.maxTime - time.Since(m.roundStart).Seconds()
+		if left < 0 {
+			left = 0
+		}
+		frac := 0.0
+		if m.maxTime > 0 {
+			frac = left / m.maxTime
+		}
+		filled := int(frac * float64(barWidth))
+		if filled > barWidth {
+			filled = barWidth
+		}
+		if filled < 0 {
+			filled = 0
+		}
+		bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+		barS := ui.StyleHit.Render(bar)
+		if frac < 0.3 {
+			barS = ui.StyleMiss.Render(bar)
+		}
+		target := ui.StyleMain.Render("» " + label(m.target) + " «")
+		if m.golden {
+			target = ui.StyleGold.Render("★ " + label(m.target) + " ★ +1♥")
+		}
+		targetBody = target + "\n" + barS
+		if m.feedback != "" && time.Since(m.feedbackAt) < 4*time.Second {
+			targetBody += "\n" + m.feedback
+		}
+		if m.errMsg != "" {
+			targetBody += "\n" + ui.StyleMiss.Render("keyboard error: "+m.errMsg)
+		}
 	}
-	left := m.maxTime - time.Since(m.roundStart).Seconds()
-	if left < 0 {
-		left = 0
+	targetCard := ui.RenderCard("target ✦ hit it", targetBody, true)
+
+	body := lipgloss.JoinHorizontal(lipgloss.Top, scoreCard, targetCard)
+	if lipgloss.Width(body) > width {
+		body = scoreCard + "\n" + targetCard
 	}
-	filled := int(left / m.maxTime * float64(barWidth))
-	if filled > barWidth {
-		filled = barWidth
-	}
-	bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
-	barS := barStyle.Render(bar)
-	if left < m.maxTime*0.3 {
-		barS = barLowStyle.Render(bar)
-	}
-	target := label(m.target)
-	if m.golden {
-		target = goldStyle.Render(target + " ★")
-	}
-	b.WriteString("\n target " + target + "  " + barS + "\n")
-	if m.feedback != "" {
-		b.WriteString("\n " + m.feedback + "\n")
-	}
-	if m.errMsg != "" {
-		b.WriteString("\n " + missStyle.Render("keyboard error: "+m.errMsg) + "\n")
-	}
-	return b.String()
+	return header + "\n" + strip + "\n" + body + "\n" +
+		ui.StyleDim.Render(" esc quits ✦ type the lit key ✦ golden = +1♥")
 }
 
-func hearts(lives int) string {
+func (m Model) gameOverCard() string {
+	st := m.Score()
+	lines := fmt.Sprintf("SCORE  %d\nBEST   %d\nHITS   %d   MISS   %d   ACC %d%%\nCOMBO  x%d   AVG %dms",
+		st.Score, st.HighScore, st.Hits, st.Misses, st.Accuracy, st.MaxCombo, st.AvgReaction)
+	if st.NewHigh {
+		lines += "\n" + ui.StyleGold.Render("★ NEW HIGH SCORE ★")
+	} else {
+		lines += "\n" + ui.StyleDim.Render("best "+fmt.Sprintf("%d", st.HighScore))
+	}
+	return ui.RenderCard("game over ✦ board restored", lines, true)
+}
+
+// Score summarizes without persisting; Finish persists the highscore.
+func (m Model) Score() Stats {
+	return summarize(m.score, m.hits, m.misses, m.level, m.maxCombo, m.reactions, time.Since(m.start).Seconds(), false)
+}
+
+func (m Model) avgReaction() string {
+	if len(m.reactions) == 0 {
+		return "—"
+	}
+	sum := 0
+	for _, r := range m.reactions {
+		sum += r
+	}
+	return fmt.Sprintf("%dms", sum/len(m.reactions))
+}
+
+func moleHearts(lives int) string {
 	if lives < 0 {
 		lives = 0
 	}
 	if lives > maxLives {
 		lives = maxLives
 	}
-	return strings.Repeat("♥", lives) + strings.Repeat("·", maxLives-lives)
+	full := ui.Pill("♥", ui.ColorPopTartPink)
+	empty := ui.StyleDim.Render("·")
+	var sb strings.Builder
+	for i := 0; i < maxLives; i++ {
+		if i < lives {
+			sb.WriteString(full + " ")
+		} else {
+			sb.WriteString(empty + " ")
+		}
+	}
+	return sb.String()
 }
 
 // Stats is the end-of-run summary.
@@ -286,50 +563,105 @@ type Stats struct {
 
 // Finish summarizes the run and persists the highscore.
 func (m Model) Finish() Stats {
-	st := Stats{Score: m.score, Hits: m.hits, Misses: m.misses,
-		Accuracy: m.hits * 100 / max(1, m.hits+m.misses), Level: m.level,
-		MaxCombo: m.maxCombo, Duration: time.Since(m.start).Seconds()}
-	if len(m.reactions) > 0 {
+	return summarize(m.score, m.hits, m.misses, m.level, m.maxCombo, m.reactions, time.Since(m.start).Seconds(), true)
+}
+
+func summarize(score, hits, misses, level, maxCombo int, reactions []int, duration float64, persist bool) Stats {
+	st := Stats{Score: score, Hits: hits, Misses: misses,
+		Accuracy: hits * 100 / max(1, hits+misses), Level: level,
+		MaxCombo: maxCombo, Duration: duration}
+	if len(reactions) > 0 {
 		sum := 0
-		for _, r := range m.reactions {
+		for _, r := range reactions {
 			sum += r
 		}
-		st.AvgReaction = sum / len(m.reactions)
+		st.AvgReaction = sum / len(reactions)
 	}
 	st.HighScore = loadHigh()
-	if st.Score > st.HighScore {
+	if score > st.HighScore {
 		st.NewHigh = true
-		st.HighScore = st.Score
-		saveHigh(st.Score)
+		st.HighScore = score
+		if persist {
+			_ = saveHigh(score) // best-effort; gameplay must not fail on IO
+		}
 	}
 	return st
 }
 
-func highPath() string {
+// hearts renders a text-only lives row for logs and tests.
+func hearts(lives int) string {
+	if lives < 0 {
+		lives = 0
+	}
+	if lives > maxLives {
+		lives = maxLives
+	}
+	return strings.Repeat("♥", lives) + strings.Repeat("·", maxLives-lives)
+}
+
+func highPath() (string, error) {
 	dir, err := os.UserConfigDir()
-	if err != nil {
+	if err != nil || dir == "" {
 		dir = os.Getenv("HOME")
 	}
-	return filepath.Join(dir, "ak820", "mole_highscore.json")
+	if dir == "" {
+		return "", fmt.Errorf("no config dir (HOME unset)")
+	}
+	return filepath.Join(dir, "ak820", "mole_highscore.json"), nil
 }
 
 func loadHigh() int {
-	b, err := os.ReadFile(highPath())
+	p, err := highPath()
+	if err != nil {
+		return 0
+	}
+	b, err := os.ReadFile(p)
 	if err != nil {
 		return 0
 	}
 	var v struct {
 		HighScore int `json:"highscore"`
 	}
-	_ = json.Unmarshal(b, &v)
+	if err := json.Unmarshal(b, &v); err != nil {
+		return 0
+	}
+	if v.HighScore < 0 {
+		return 0
+	}
 	return v.HighScore
 }
 
-func saveHigh(score int) {
-	p := highPath()
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return
+// saveHigh persists atomically (temp + rename) so concurrent runs cannot
+// corrupt the file. Errors are returned for diagnostics.
+func saveHigh(score int) error {
+	p, err := highPath()
+	if err != nil {
+		return err
 	}
-	b, _ := json.Marshal(map[string]int{"highscore": score})
-	_ = os.WriteFile(p, b, 0o644)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return err
+	}
+	b, err := json.Marshal(map[string]int{"highscore": score})
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(p), "mole_highscore-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return os.Rename(tmpName, p)
 }

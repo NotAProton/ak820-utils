@@ -1,6 +1,8 @@
 // Package kb is the client for the ak820 core command. It discovers the
 // key geometry from `ak820 agent-context` and streams per-key frames through
-// `ak820 pipe`, so no device or protocol knowledge lives in this repository.
+// `ak820 pipe`, so no HID device handling lives in this repository. Mode
+// changes go through `ak820 set mode` (pure consumer); the pipe carries only
+// per-key frame lines derived from the agent-context geometry.
 package kb
 
 import (
@@ -26,6 +28,26 @@ type manifest struct {
 	} `json:"per_key"`
 }
 
+// syncBuffer is a goroutine-safe bytes.Buffer for the child stderr stream:
+// the pipe process writes from its own goroutine while pipeError/Restore/
+// Diagnostics read from the TUI goroutine.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
 // KB streams per-key color updates to the keyboard through the ak820 core.
 type KB struct {
 	keymap   map[string]int
@@ -34,13 +56,19 @@ type KB struct {
 	perFrame int
 	slots    [][]byte // [slots][3]RGB
 
-	mu     sync.Mutex
+	mu     sync.Mutex // guards stdin/proc/closed below
 	proc   *exec.Cmd
 	stdin  io.WriteCloser
-	stderr *bytes.Buffer
+	closed bool
+
+	stderr *syncBuffer
+
+	slotMu sync.RWMutex // guards slots; Flush may run apart from Set*
 }
 
-// Open resolves the keymap and starts a persistent pipe to the core binary.
+// Open resolves the keymap from the core binary. It does not touch the
+// keyboard lighting and does not start the pipe; call EnterCustomMode /
+// SetBrightness first, then StartPipe before Flush.
 func Open() (*KB, error) {
 	if _, err := exec.LookPath("ak820"); err != nil {
 		return nil, fmt.Errorf("the ak820 core binary is required in PATH; build it from github.com/NotAProton/ak820-go-drivers (make install): %w", err)
@@ -53,12 +81,24 @@ func Open() (*KB, error) {
 	if err := json.Unmarshal(out, &m); err != nil {
 		return nil, fmt.Errorf("parsing ak820 agent-context: %w", err)
 	}
-	if m.PerKey.Slots == 0 {
+	if m.PerKey.Slots <= 0 {
 		return nil, fmt.Errorf("ak820 agent-context has no per_key section; upgrade the core binary")
 	}
-	base, err := strconv.ParseUint(strings.TrimPrefix(m.PerKey.CmdBase, "0x"), 16, 8)
+	if m.PerKey.Frames <= 0 || m.PerKey.KeysPerFrame <= 0 {
+		return nil, fmt.Errorf("ak820 agent-context has invalid geometry (frames=%d keys_per_frame=%d)", m.PerKey.Frames, m.PerKey.KeysPerFrame)
+	}
+	baseStr := m.PerKey.CmdBase
+	lower := strings.ToLower(baseStr)
+	lower = strings.TrimPrefix(lower, "0x")
+	if lower == "" {
+		return nil, fmt.Errorf("bad per-key cmd base %q", m.PerKey.CmdBase)
+	}
+	base, err := strconv.ParseUint(lower, 16, 8)
 	if err != nil {
 		return nil, fmt.Errorf("bad per-key cmd base %q: %w", m.PerKey.CmdBase, err)
+	}
+	if int(base)+m.PerKey.Frames > 0x100 {
+		return nil, fmt.Errorf("per-key cmd range overflows a byte (base %q frames %d)", m.PerKey.CmdBase, m.PerKey.Frames)
 	}
 
 	k := &KB{
@@ -67,23 +107,42 @@ func Open() (*KB, error) {
 		frames:   m.PerKey.Frames,
 		perFrame: m.PerKey.KeysPerFrame,
 		slots:    make([][]byte, m.PerKey.Slots),
-		stderr:   &bytes.Buffer{},
+		stderr:   &syncBuffer{},
 	}
 	for i := range k.slots {
 		k.slots[i] = []byte{0, 0, 0}
 	}
-
-	k.proc = exec.Command("ak820", "pipe", "--yes", "--quiet")
-	k.proc.Stderr = k.stderr
-	stdin, err := k.proc.StdinPipe()
-	if err != nil {
-		return nil, err
-	}
-	k.stdin = stdin
-	if err := k.proc.Start(); err != nil {
-		return nil, fmt.Errorf("starting ak820 pipe: %w", err)
-	}
+	// NOTE: the pipe is NOT started here. Mode changes (EnterCustomMode /
+	// SetBrightness) run as separate `ak820` processes and the core holds an
+	// exclusive lock on the hidraw node, so the pipe must start after them.
+	// Call StartPipe once the mode is set.
 	return k, nil
+}
+
+// StartPipe starts the persistent `ak820 pipe` process for per-key frames.
+// It must be called after EnterCustomMode/SetBrightness and before Flush.
+func (k *KB) StartPipe() error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.closed {
+		return fmt.Errorf("ak820 pipe: closed")
+	}
+	if k.stdin != nil {
+		return nil // already started
+	}
+	proc := exec.Command("ak820", "pipe", "--yes", "--quiet")
+	proc.Stderr = k.stderr
+	stdin, err := proc.StdinPipe()
+	if err != nil {
+		return err
+	}
+	if err := proc.Start(); err != nil {
+		_ = stdin.Close()
+		return fmt.Errorf("starting ak820 pipe: %w", err)
+	}
+	k.proc = proc
+	k.stdin = stdin
+	return nil
 }
 
 // Key returns the slot index for a key name.
@@ -95,69 +154,130 @@ func (k *KB) Key(name string) (int, bool) {
 // SlotCount returns the number of addressable per-key RGB slots.
 func (k *KB) SlotCount() int { return len(k.slots) }
 
-// SetSlot queues a color for one slot; Flush transmits.
-func (k *KB) SetSlot(slot int, r, g, b byte) {
+// SetSlot queues a color for one slot; Flush transmits. It reports whether
+// the slot was valid so geometry mismatches are detectable.
+func (k *KB) SetSlot(slot int, r, g, b byte) bool {
+	k.slotMu.Lock()
+	defer k.slotMu.Unlock()
 	if slot < 0 || slot >= len(k.slots) {
-		return
+		return false
 	}
 	k.slots[slot] = []byte{r, g, b}
+	return true
 }
 
 // SetAll queues one color for every slot.
 func (k *KB) SetAll(r, g, b byte) {
+	k.slotMu.Lock()
+	defer k.slotMu.Unlock()
 	for i := range k.slots {
 		k.slots[i] = []byte{r, g, b}
 	}
 }
 
+// snapshot copies the slot buffer for transmission without holding the lock
+// during I/O.
+func (k *KB) snapshot() [][]byte {
+	k.slotMu.RLock()
+	defer k.slotMu.RUnlock()
+	out := make([][]byte, len(k.slots))
+	for i, s := range k.slots {
+		c := make([]byte, 3)
+		copy(c, s)
+		out[i] = c
+	}
+	return out
+}
+
 // Flush sends the queued per-key colors through the core pipe.
 func (k *KB) Flush() error {
-	k.mu.Lock()
-	defer k.mu.Unlock()
+	slots := k.snapshot()
 	var buf bytes.Buffer
 	for f := 0; f < k.frames; f++ {
 		payload := make([]byte, 0, k.perFrame*3)
-		for s := f * k.perFrame; s < (f+1)*k.perFrame && s < len(k.slots); s++ {
-			payload = append(payload, k.slots[s]...)
+		for s := f * k.perFrame; s < (f+1)*k.perFrame && s < len(slots); s++ {
+			payload = append(payload, slots[s]...)
 		}
-		fmt.Fprintf(&buf, "0x%02x %s\n", int(k.cmdBase)+f, hex.EncodeToString(payload))
+		if f == k.frames-1 {
+			// Last frame may be short when slots is not a multiple of
+			// perFrame; pad with zeros to keep frame length stable.
+			for len(payload) < k.perFrame*3 {
+				payload = append(payload, 0)
+			}
+		}
+		if len(payload) == 0 {
+			fmt.Fprintf(&buf, "0x%02x\n", int(k.cmdBase)+f)
+		} else {
+			fmt.Fprintf(&buf, "0x%02x %s\n", int(k.cmdBase)+f, hex.EncodeToString(payload))
+		}
 	}
-	if _, err := k.stdin.Write(buf.Bytes()); err != nil {
+	k.mu.Lock()
+	w := k.stdin
+	closed := k.closed
+	k.mu.Unlock()
+	if closed || w == nil {
+		return fmt.Errorf("ak820 pipe: closed")
+	}
+	if _, err := w.Write(buf.Bytes()); err != nil {
 		return k.pipeError(err)
 	}
 	return nil
 }
 
-// sendRaw queues nothing; it writes one explicit command line (cmd + payload).
-func (k *KB) sendRaw(cmd byte, payload []byte) error {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	_, err := fmt.Fprintf(k.stdin, "0x%02x %s\n", cmd, hex.EncodeToString(payload))
-	return k.pipeError(err)
-}
-
-// EnterCustomMode switches the keyboard to custom per-key lighting.
+// EnterCustomMode switches the keyboard to custom per-key lighting via the
+// core CLI (no protocol bytes owned here). The pipe stays open for the
+// per-key frames that follow.
 func (k *KB) EnterCustomMode() error {
-	if err := k.sendRaw(0x07, []byte{0x17, 4, 3, 0, 0}); err != nil {
-		return err
+	cmd := exec.Command("ak820", "set", "mode", "24",
+		"--brightness", "5", "--speed", "5", "--quiet")
+	var eb syncBuffer
+	cmd.Stderr = &eb
+	if err := cmd.Run(); err != nil {
+		detail := strings.TrimSpace(eb.String())
+		if detail != "" {
+			return fmt.Errorf("ak820 set mode 24: %w: %s", err, detail)
+		}
+		return fmt.Errorf("ak820 set mode 24: %w", err)
 	}
-	if err := k.sendRaw(0x0B, nil); err != nil {
-		return err
-	}
-	return k.sendRaw(0x09, nil)
+	return nil
 }
 
-// Restore returns the keyboard to the factory-default lighting.
-func (k *KB) Restore() error {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	if k.stdin == nil {
-		return nil
+// SetBrightness sets the board's master backlight to level (1-5) while
+// staying in custom per-key mode, via the core CLI.
+func (k *KB) SetBrightness(level int) error {
+	if level < 1 {
+		level = 1
 	}
-	cmd := exec.Command("ak820", "set", "mode", "1", "--quiet")
-	cmd.Stderr = k.stderr
+	if level > 5 {
+		level = 5
+	}
+	cmd := exec.Command("ak820", "set", "mode", "24",
+		"--brightness", strconv.Itoa(level), "--no-apply", "--quiet")
+	var eb syncBuffer
+	cmd.Stderr = &eb
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("ak820 set mode 1: %w (%s)", err, strings.TrimSpace(k.stderr.String()))
+		detail := strings.TrimSpace(eb.String())
+		if detail != "" {
+			return fmt.Errorf("ak820 set mode 24 --brightness %d: %w: %s", level, err, detail)
+		}
+		return fmt.Errorf("ak820 set mode 24 --brightness %d: %w", level, err)
+	}
+	return nil
+}
+
+// Restore returns the keyboard to the factory-default lighting. It is
+// independent of the pipe lifecycle so it works before or after Close and
+// from signal handlers.
+func (k *KB) Restore() error {
+	var eb syncBuffer
+	cmd := exec.Command("ak820", "set", "mode", "1", "--quiet")
+	cmd.Stderr = &eb
+	if err := cmd.Run(); err != nil {
+		detail := strings.TrimSpace(eb.String())
+		if detail != "" {
+			return fmt.Errorf("ak820 set mode 1: %w (%s)", err, detail)
+		}
+		return fmt.Errorf("ak820 set mode 1: %w", err)
 	}
 	return nil
 }
@@ -173,18 +293,23 @@ func (k *KB) pipeError(err error) error {
 	return fmt.Errorf("ak820 pipe: %w", err)
 }
 
-// Close stops the pipe process.
+// Close stops the pipe process. It is idempotent. The mutex is not held
+// across proc.Wait so a concurrent Flush cannot stall teardown.
 func (k *KB) Close() {
 	k.mu.Lock()
-	defer k.mu.Unlock()
-	if k.stdin != nil {
-		k.stdin.Close()
-		k.stdin = nil
+	w := k.stdin
+	p := k.proc
+	k.stdin = nil
+	k.proc = nil
+	k.closed = true
+	k.mu.Unlock()
+	if w != nil {
+		_ = w.Close()
 	}
-	if k.proc != nil {
-		_ = k.proc.Wait()
+	if p != nil {
+		_ = p.Wait()
 	}
 }
 
-// Scanner exposes the pipe stderr for diagnostics.
+// Diagnostics exposes the pipe stderr for troubleshooting.
 func (k *KB) Diagnostics() string { return strings.TrimSpace(k.stderr.String()) }

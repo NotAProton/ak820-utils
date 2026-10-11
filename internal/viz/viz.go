@@ -6,18 +6,20 @@ package viz
 import (
 	"bufio"
 	"fmt"
-	"math/rand"
 	"os"
 	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/NotAProton/ak820-utils/internal/kb"
+	"github.com/NotAProton/ak820-utils/internal/ui"
 )
 
 const (
@@ -41,24 +43,47 @@ type theme struct {
 
 var themes = []theme{
 	{
-		name: "synthwave", peakColor: "229",
-		colors:  []string{"236", "53", "127", "199", "213", "218"},
+		name: "synthwave", peakColor: "#ffe57f",
+		colors:  []string{"#2a1b3d", "#ff77a9", "#ba77ff", "#ff5983", "#ffea6c", "#ffe57f"},
 		keyGrad: [][3]byte{{10, 2, 30}, {60, 8, 90}, {140, 10, 130}, {220, 30, 120}, {255, 90, 90}, {255, 200, 120}},
 		peakRGB: [3]byte{255, 255, 220},
 	},
 	{
-		name: "ocean", peakColor: "231",
-		colors:  []string{"17", "24", "32", "39", "81", "123"},
+		name: "ocean", peakColor: "#f8f8f2",
+		colors:  []string{"#0c1b2e", "#1d4e89", "#3bc9ff", "#56f89a", "#b8fff0", "#f8f8f2"},
 		keyGrad: [][3]byte{{0, 5, 25}, {0, 40, 90}, {0, 100, 160}, {0, 170, 210}, {60, 220, 230}, {200, 255, 250}},
 		peakRGB: [3]byte{255, 255, 255},
 	},
 	{
-		name: "fire", peakColor: "231",
-		colors:  []string{"52", "88", "124", "166", "208", "220"},
+		name: "fire", peakColor: "#fff6d8",
+		colors:  []string{"#2b0f0c", "#7a1f0f", "#ff5a2a", "#ff944d", "#ffea6c", "#fff6d8"},
 		keyGrad: [][3]byte{{15, 0, 0}, {90, 8, 0}, {180, 30, 0}, {240, 90, 0}, {255, 160, 20}, {255, 240, 120}},
 		peakRGB: [3]byte{255, 255, 255},
 	},
 }
+
+// styleCache memoizes one foreground style per color so View never builds
+// styles inside the per-cell loop.
+var styleCache = struct {
+	sync.RWMutex
+	m map[string]lipgloss.Style
+}{m: make(map[string]lipgloss.Style)}
+
+func fgStyle(color string) lipgloss.Style {
+	styleCache.RLock()
+	s, ok := styleCache.m[color]
+	styleCache.RUnlock()
+	if ok {
+		return s
+	}
+	s = lipgloss.NewStyle().Foreground(lipgloss.Color(color))
+	styleCache.Lock()
+	styleCache.m[color] = s
+	styleCache.Unlock()
+	return s
+}
+
+var dimCellStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#2a3258"))
 
 // ThemeNames lists available themes.
 func ThemeNames() []string {
@@ -84,6 +109,8 @@ var ambient = [3]byte{2, 0, 8}
 
 // layout assigns every addressable key a bar column and row, following the
 // keyboard's physical geometry (row bands top to bottom, x-order within).
+// Unknown keys are skipped so board variants degrade to a dark key instead
+// of a panic; short coordinate rows are guarded for the same reason.
 func layout(board *kb.KB) []keyCell {
 	rows := [][]string{
 		{"esc", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "del"},
@@ -103,15 +130,24 @@ func layout(board *kb.KB) []keyCell {
 	}
 	var cells []keyCell
 	for r, row := range rows {
+		if r >= len(rowX) {
+			continue
+		}
 		for i, name := range row {
 			slot, ok := board.Key(name)
 			if !ok {
+				continue
+			}
+			if i >= len(rowX[r]) {
 				continue
 			}
 			x := rowX[r][i]
 			bar := int(x * numBars)
 			if bar >= numBars {
 				bar = numBars - 1
+			}
+			if bar < 0 {
+				bar = 0
 			}
 			cells = append(cells, keyCell{
 				slot: slot, bar: bar, row: r,
@@ -133,40 +169,53 @@ type Model struct {
 	peaks     []float64
 	raw       chan cavaMsg
 	cava      *exec.Cmd
+	cavaCfg   string
 	quit      chan struct{}
-	rng       *rand.Rand
+	closed    *atomic.Bool
 	errMsg    string
 	lastFrame time.Time
+	lastPaint time.Time
 
 	modeIx int
 	fx     modeState
 	startT time.Time
 	spec   spectrum
+
+	width int
 }
 
-// New builds the model and starts cava.
+// New builds the model and starts cava. Unknown themes are an error so
+// typos never silently run a different theme.
 func New(board *kb.KB, themeName string) (Model, error) {
+	ix, ok := indexOfTheme(themeName)
+	if !ok {
+		return Model{}, fmt.Errorf("unknown theme %q; valid: %s", themeName, strings.Join(ThemeNames(), " "))
+	}
 	m := Model{
-		kb: board, cells: layout(board),
+		kb: board, cells: layout(board), themeIx: ix,
 		bars: make([]float64, numBars), peaks: make([]float64, numBars),
 		raw: make(chan cavaMsg, 8), quit: make(chan struct{}),
-		rng:    rand.New(rand.NewSource(time.Now().UnixNano())),
+		closed: &atomic.Bool{},
 		startT: time.Now(),
+		width:  80,
 	}
-	m.themeIx = indexOfTheme(themeName)
+	m.lastFrame = time.Now()
+	m.lastPaint = time.Now()
+	m.fx.beats.cooldown = DefaultBeatCooldown
 	if err := m.startCava(); err != nil {
+		m.cleanupFailedStart()
 		return Model{}, err
 	}
 	return m, nil
 }
 
-func indexOfTheme(name string) int {
+func indexOfTheme(name string) (int, bool) {
 	for i, t := range themes {
 		if t.name == name {
-			return i
+			return i, true
 		}
 	}
-	return 0
+	return 0, false
 }
 
 func (m *Model) startCava() error {
@@ -177,6 +226,7 @@ func (m *Model) startCava() error {
 	if err != nil {
 		return err
 	}
+	m.cavaCfg = cfg.Name()
 	fmt.Fprintf(cfg, `[general]
 bars = %d
 framerate = 60
@@ -193,9 +243,11 @@ raw_target = /dev/stdout
 data_format = ascii
 ascii_max_range = 100
 `, numBars)
-	cfg.Close()
+	if err := cfg.Close(); err != nil {
+		return err
+	}
 
-	cmd := exec.Command("cava", "-p", cfg.Name())
+	cmd := exec.Command("cava", "-p", m.cavaCfg)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -204,24 +256,50 @@ ascii_max_range = 100
 		return fmt.Errorf("starting cava: %w", err)
 	}
 	m.cava = cmd
+	quit := m.quit
+	raw := m.raw
 	go func() {
+		defer stdout.Close()
 		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 		for scanner.Scan() {
-			parts := strings.Split(strings.TrimRight(scanner.Text(), ";"), ";")
+			select {
+			case <-quit:
+				return
+			default:
+			}
+			text := strings.TrimSpace(scanner.Text())
+			text = strings.TrimSuffix(text, ";")
+			if text == "" {
+				continue
+			}
+			parts := strings.Split(text, ";")
 			if len(parts) != numBars {
 				continue
 			}
 			msg := make(cavaMsg, numBars)
-			for i, p := range parts {
-				v, err := strconv.Atoi(p)
+			valid := true
+			for i, f := range parts {
+				f = strings.TrimSpace(f)
+				v, err := strconv.Atoi(f)
 				if err != nil {
-					continue
+					valid = false
+					break
+				}
+				if v < 0 {
+					v = 0
+				}
+				if v > 100 {
+					v = 100
 				}
 				msg[i] = v
 			}
+			if !valid {
+				continue
+			}
 			select {
-			case m.raw <- msg:
-			case <-m.quit:
+			case raw <- msg:
+			case <-quit:
 				return
 			}
 		}
@@ -229,19 +307,33 @@ ascii_max_range = 100
 	return nil
 }
 
+// cleanupFailedStart removes the temp config when startCava fails after
+// creating it. Called only on the New error path (no cava running yet).
+func (m *Model) cleanupFailedStart() {
+	if m.cavaCfg != "" {
+		_ = os.Remove(m.cavaCfg)
+		m.cavaCfg = ""
+	}
+}
+
 // Init kicks off the render loop and the cava subscription.
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(m.tick(), m.listenCava())
 }
 
-// listenCava forwards the next spectrum read into the program.
+// listenCava forwards the next spectrum read into the program, or exits
+// when the model is closed.
 func (m Model) listenCava() tea.Cmd {
 	return func() tea.Msg {
-		msg, ok := <-m.raw
-		if !ok {
+		select {
+		case msg, ok := <-m.raw:
+			if !ok {
+				return nil
+			}
+			return msg
+		case <-m.quit:
 			return nil
 		}
-		return msg
 	}
 }
 
@@ -252,17 +344,27 @@ func (m Model) tick() tea.Cmd {
 // Update consumes bars and renders.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = ui.ClampWidth(msg.Width)
+		return m, nil
 	case cavaMsg:
+		if len(msg) < numBars || len(m.bars) < numBars || len(m.peaks) < numBars {
+			return m, m.listenCava()
+		}
 		now := time.Now()
 		dt := now.Sub(m.lastFrame).Seconds()
 		if dt <= 0 || dt > 0.5 {
 			dt = 1.0 / 60.0
 		}
 		m.lastFrame = now
+		m.lastPaint = now
 		// Smooth the raw bars for the terminal spectrum.
 		attack := minF(1.0, dt*25)
 		fall := minF(1.0, dt*18)
 		for i, v := range msg {
+			if i >= len(m.bars) {
+				break
+			}
 			lvl := float64(v) / 100.0
 			if lvl > m.bars[i] {
 				m.bars[i] += (lvl - m.bars[i]) * attack
@@ -273,6 +375,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.peaks[i] = m.bars[i]
 			} else {
 				m.peaks[i] -= 0.45 * dt
+				if m.peaks[i] < 0 {
+					m.peaks[i] = 0
+				}
 			}
 		}
 		// Fold the frame into the shared spectrum the modes read.
@@ -287,24 +392,72 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.paintKeyboard(now, dt)
 		return m, m.listenCava()
 	case tickMsg:
+		// Animate flowing modes even when cava is silent so plasma and
+		// ripples never freeze between frames.
+		now := time.Now()
+		dt := now.Sub(m.lastPaint).Seconds()
+		if dt <= 0 || dt > 0.5 {
+			dt = 1.0 / 60.0
+		}
+		m.lastPaint = now
+		// Decay peaks toward zero on ticks without audio.
+		for i := range m.peaks {
+			if i < len(m.bars) && m.peaks[i] > m.bars[i] {
+				m.peaks[i] -= 0.45 * dt
+				if m.peaks[i] < 0 {
+					m.peaks[i] = 0
+				}
+			}
+		}
+		// Advance the quiet timer so the idle starfield fades in. Ticks do
+		// not fold silence into the spectrum; only cava frames move levels.
+		if m.spec.overall > 0.03 {
+			m.spec.quietFor = 0
+		} else {
+			m.spec.quietFor += dt
+			if m.spec.quietFor > 30 {
+				m.spec.quietFor = 30
+			}
+		}
+		m.paintKeyboard(now, dt)
 		return m, m.tick()
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "esc", "q":
 			return m, tea.Quit
 		case "m", "tab":
-			m.modeIx = (m.modeIx + 1) % numModes
+			if numModes > 0 {
+				m.modeIx = (m.modeIx + 1) % numModes
+			}
 		case "t":
-			m.themeIx = (m.themeIx + 1) % len(themes)
+			if len(themes) > 0 {
+				m.themeIx = (m.themeIx + 1) % len(themes)
+			}
 		}
 	}
 	return m, nil
 }
 
 // paintKeyboard paints every mode's per-key colors and flushes to the board.
+// Flush failures surface in the TUI instead of failing silently. A nil
+// board or empty geometry renders nothing so unit tests can exercise paint
+// logic without hardware.
 func (m *Model) paintKeyboard(now time.Time, dt float64) {
+	if m.themeIx < 0 || m.themeIx >= len(themes) {
+		m.themeIx = 0
+	}
+	if m.modeIx < 0 || m.modeIx >= numModes {
+		m.modeIx = 0
+	}
+	if dt <= 0 || dt > 0.5 {
+		dt = 1.0 / 60.0
+	}
 	t := themes[m.themeIx]
 	m.fx.frame++
+	m.stepDynamics(dt, &m.spec, now)
+	if m.kb == nil || len(m.cells) == 0 {
+		return
+	}
 	for _, c := range m.cells {
 		var rgb [3]byte
 		switch m.modeIx {
@@ -321,10 +474,20 @@ func (m *Model) paintKeyboard(now time.Time, dt float64) {
 		}
 		m.kb.SetSlot(c.slot, rgb[0], rgb[1], rgb[2])
 	}
-	_ = m.kb.Flush()
+	if err := m.kb.Flush(); err != nil {
+		m.errMsg = "keyboard error: " + err.Error()
+	} else {
+		m.errMsg = ""
+	}
 }
 
 func gradRGB(grad [][3]byte, val float64) (byte, byte, byte) {
+	if len(grad) == 0 {
+		return 0, 0, 0
+	}
+	if len(grad) == 1 {
+		return grad[0][0], grad[0][1], grad[0][2]
+	}
 	if val < 0 {
 		val = 0
 	}
@@ -334,10 +497,22 @@ func gradRGB(grad [][3]byte, val float64) (byte, byte, byte) {
 	f := val * float64(len(grad)-1)
 	i0 := int(f)
 	i1 := i0 + 1
+	if i0 < 0 {
+		i0 = 0
+	}
+	if i0 >= len(grad) {
+		i0 = len(grad) - 1
+	}
 	if i1 >= len(grad) {
 		i1 = len(grad) - 1
 	}
 	t := f - float64(i0)
+	if t < 0 {
+		t = 0
+	}
+	if t > 1 {
+		t = 1
+	}
 	c0, c1 := grad[i0], grad[i1]
 	mix := func(a, b byte) byte {
 		return byte(float64(a) + (float64(b)-float64(a))*t)
@@ -347,48 +522,105 @@ func gradRGB(grad [][3]byte, val float64) (byte, byte, byte) {
 
 // View renders the terminal spectrum.
 func (m Model) View() string {
-	t := themes[m.themeIx]
-	var b strings.Builder
-	b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).
-		Render(fmt.Sprintf(" AK820 SPECTRUM — %s — %s ", t.name, modeNames[m.modeIx])) +
-		dimStyle().Render("  m/tab: mode   t: theme   q: quit") + "\n")
+	themeIx := m.themeIx
+	if themeIx < 0 || themeIx >= len(themes) {
+		themeIx = 0
+	}
+	modeIx := m.modeIx
+	if modeIx < 0 || modeIx >= numModes {
+		modeIx = 0
+	}
+	t := themes[themeIx]
+	width := ui.ClampWidth(m.width)
+	if width < 40 {
+		width = 40
+	}
 
-	// Spectrum: top row first; each cell shows the bar level at that height.
+	header := lipgloss.JoinHorizontal(lipgloss.Center,
+		ui.Badge("ak820 spectrum", true), " ",
+		ui.Pill(t.name, ui.ColorSparkleGold), " ",
+		ui.Pill(modeNames[modeIx], ui.ColorRainbowBlue))
+
+	strip := ui.RenderRainbowStrip(width - 4)
+
+	// Spectrum card: top row first; each cell shows the bar level.
 	var rows []string
 	for r := numRows - 1; r >= 0; r-- {
 		threshold := float64(r) / float64(numRows-1)
 		var line strings.Builder
 		for bar := 0; bar < numBars; bar++ {
-			lvl := m.bars[bar]
-			pk := m.peaks[bar]
+			var lvl, pk float64
+			if bar < len(m.bars) {
+				lvl = m.bars[bar]
+			}
+			if bar < len(m.peaks) {
+				pk = m.peaks[bar]
+			}
 			switch {
 			case lvl > 0.01 && threshold <= lvl:
-				line.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(t.colors[colorIndex(lvl)])).Render("██"))
+				line.WriteString(fgStyle(t.colors[colorIndex(lvl)]).Render("██"))
 			case abs(threshold-pk) < 0.14 && pk > 0.15:
-				line.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(t.peakColor)).Render("──"))
+				line.WriteString(fgStyle(t.peakColor).Render("──"))
 			default:
-				line.WriteString(dimStyle().Render("░░"))
+				line.WriteString(dimCellStyle.Render("··"))
 			}
 		}
 		rows = append(rows, line.String())
 	}
-	b.WriteString(strings.Join(rows, "\n"))
+	specBody := strings.Join(rows, "\n")
 	if m.errMsg != "" {
-		b.WriteString("\n" + m.errMsg)
+		specBody += "\n" + ui.StyleMiss.Render("✦ keyboard error: "+m.errMsg)
 	}
-	return b.String()
+	specCard := ui.RenderCard("spectrum ✧ live eq", specBody, true)
+
+	// Mode card lists every mode with an active marker.
+	var modeLines []string
+	for i, name := range modeNames {
+		marker := "·"
+		if i == modeIx {
+			marker = "»"
+			modeLines = append(modeLines, ui.StyleMain.Render(marker+" "+name+" ★"))
+		} else {
+			modeLines = append(modeLines, ui.StyleDim.Render(marker+" "+name))
+		}
+	}
+	// Theme card lists every theme with an active marker.
+	var themeLines []string
+	for i, th := range themes {
+		if i == themeIx {
+			themeLines = append(themeLines, ui.StyleMain.Render("» "+th.name+" ★"))
+		} else {
+			themeLines = append(themeLines, ui.StyleDim.Render("· "+th.name))
+		}
+	}
+	level := int(clamp01(m.spec.overall) * 12)
+	lvlBar := strings.Repeat("■", level) + strings.Repeat("·", 12-level)
+	sideBody := "MODES\n" + strings.Join(modeLines, "\n") +
+		"\n\nTHEMES\n" + strings.Join(themeLines, "\n") +
+		"\n\nLEVEL " + fgStyle(string(ui.ColorRainbowGreen)).Render(lvlBar)
+	if m.spec.quietFor >= 2 {
+		sideBody += "\n" + ui.StyleDim.Render("✧ idle drift — play audio")
+	}
+	sideCard := ui.RenderCard("board ✦ control", sideBody, false)
+
+	body := lipgloss.JoinHorizontal(lipgloss.Top, specCard, sideCard)
+	// Wrap rather than clip when the terminal is narrow.
+	if lipgloss.Width(body) > width {
+		body = specCard + "\n" + sideCard
+	}
+	help := ui.StyleDim.Render(" m/tab: mode ✦ t: theme ✦ q: quit")
+	return header + "\n" + strip + "\n" + body + "\n" + help
 }
 
 func colorIndex(lvl float64) int {
 	i := int(lvl * 6)
+	if i < 0 {
+		i = 0
+	}
 	if i > 5 {
 		i = 5
 	}
 	return i
-}
-
-func dimStyle() lipgloss.Style {
-	return lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 }
 
 func minF(a, b float64) float64 {
@@ -405,11 +637,23 @@ func abs(x float64) float64 {
 	return x
 }
 
-// Close stops cava.
-func (m Model) Close() {
-	close(m.quit)
-	if m.cava != nil && m.cava.Process != nil {
-		_ = m.cava.Process.Kill()
-		_ = m.cava.Wait()
+// Close stops cava and removes the temp config. It is idempotent and safe
+// for concurrent callers; the mutex is not held across Process.Wait.
+func (m *Model) Close() {
+	if m.closed != nil && m.closed.CompareAndSwap(false, true) {
+		select {
+		case <-m.quit:
+		default:
+			close(m.quit)
+		}
+	}
+	cmd := m.cava
+	cfg := m.cavaCfg
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}
+	if cfg != "" {
+		_ = os.Remove(cfg)
 	}
 }

@@ -7,26 +7,30 @@ flows through the `ak820` binary: key geometry comes from
 
 ## Tools
 
-- **mole** — whack-a-mole on the physical keyboard. A key lights up, hit it
-  before the bar empties. Combos, golden moles, lives, persistent high score.
+- **mole** — whack-a-mole on the physical keyboard. The target pulses
+  white-hot to red as the bar drains, hits flash white, level-ups sweep a
+  rainbow, and the terminal shows score and target cards with a game-over
+  summary. Combos, golden moles (+1 life), lives, persistent high score.
 - **visualizer** — audio on the keyboard and in the terminal, fed by
-  [cava](https://github.com/karlstav/cava). Five geometric modes, cycled live
-  with `m`/`tab`:
+  [cava](https://github.com/karlstav/cava). Five modes with distinct color
+  logic, cycled live with `m`/`tab`; quiet input fades to an idle drift
+  instead of freezing:
 
   - **ripple** — bass beats fire concentric shockwaves from the center keys;
-    treble sparkles on the perimeter. Ripples stay circular by modeling the
-    board's 2.8:1 physical aspect.
-  - **bars** — straight vertical equalizer: band from the key's x position,
+    treble shimmers coherently on the perimeter. Ripples stay circular by
+    modeling the board's 2.8:1 physical aspect.
+  - **bars** — the only literal equalizer: band from the key's x position,
     lit strictly by row height, with falling peak markers.
   - **bloom** — dual stereo bubbles under the left (E/D) and right (I/K)
-    hands expand and contract with the left/right channels, blending colors
-    where they meet.
-  - **plasma** — an undulating surface: bass drives height, mids drive phase,
-    treble adds turbulence.
-  - **wings** — bass pulses from the center keys and fans outward toward Esc
-    and Enter.
+    hands. The left bubble reads cool and the right reads warm, so stereo
+    width shows as color.
+  - **plasma** — the only flowing-hue mode: a drift field picks the color
+    while the level picks the brightness. Mids rotate the hue.
+  - **wings** — a bass comet: a bright front expands toward Esc and Enter
+    with a fading tail; onsets add a leading-edge kick.
 
-  Themes: synthwave, ocean, fire (`t` cycles).
+  Themes: synthwave, ocean, fire (`t` cycles). The terminal uses rounded
+  cards, rainbow ribbons, and pills, and adapts to narrow windows.
 
 ## Install
 

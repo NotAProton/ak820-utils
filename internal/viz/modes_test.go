@@ -46,7 +46,9 @@ func TestRippleRemoval(t *testing.T) {
 	c := keyCell{slot: 0, row: 3, x: 0.47, y: 0.55, px: 0.47 * kbAspect, py: 0.55}
 	var s spectrum
 	s.bass = 0.3
-	m.paintRipple(c, themes[0], time.Now(), &s)
+	now := time.Now()
+	m.stepDynamics(1.0/60.0, &s, now)
+	m.paintRipple(c, themes[0], now, &s)
 	if len(m.fx.ripples) != 0 {
 		t.Errorf("expired ripple not removed: %d left", len(m.fx.ripples))
 	}
