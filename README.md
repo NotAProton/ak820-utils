@@ -28,18 +28,14 @@ flows through the `ak820` binary: key geometry comes from
     while the level picks the brightness. Mids rotate the hue.
   - **wings** — a bass comet: a bright front expands toward Esc and Enter
     with a fading tail; onsets add a leading-edge kick.
-  - **strobe** — the whole board snaps from near-black to full-bright
-    synthwave on every bass beat, stepping pink → purple → cyan → red →
-    yellow per hit. Beats are debounced with hysteresis, so sustained
-    sections stay dark instead of blurring into glow. Photosensitivity
-    caution applies.
+  - **strobe** — Overdrive Strobe: a white-hot xenon ignition with
+    rotating spatial geometry cools through the active theme, then cuts
+    to near-black with sub-bass undercurrent and treble arc sparks.
+    Drops and bar downbeats double-tap. Photosensitivity caution applies.
 
   Themes: synthwave, ocean, fire (`t` cycles). The terminal uses rounded
-  cards, rainbow ribbons, and pills, and adapts to narrow windows.
-
-  Tempo accent: Esc, F1–F12, Del, Home, PgUp, PgDn, and End play a
-  mode-independent rainbow that steps hue on every bass beat and pulses
-  with the kick. On by default; `a` toggles live.
+  cards, rainbow ribbons, and pills, shows the locked BPM with a beat
+  indicator, and adapts to narrow windows.
 
 ## Install
 
@@ -57,8 +53,7 @@ make install    # builds, tests, installs to ~/.local/bin
 ```sh
 ak820-utils mole
 AK820_UTILS_JSON=1 ak820-utils mole   # end-of-run stats as JSON
-ak820-utils visualizer --theme ocean  # m/tab cycles modes, t themes, a accent, q quits
-ak820-utils visualizer --accent-rainbow=false  # modes only, no tempo row
+ak820-utils visualizer --theme ocean  # m/tab cycles modes, t themes, q quits
 ```
 
 ## Dependencies

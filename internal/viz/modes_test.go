@@ -276,6 +276,110 @@ func TestBoostCurve(t *testing.T) {
 	}
 }
 
+// bandTrain synthesizes multi-band frames at 60fps: a constant sub floor
+// with periodic punch kicks, optionally scaled to a quiet volume.
+func bandTrain(dur, period, sub, punchKick, snare, scale float64) []beatInput {
+	n := int(dur * 60)
+	out := make([]beatInput, n)
+	for i := range out {
+		tt := float64(i) / 60
+		punch := 0.30 * scale
+		if since := tt - float64(int(tt/period))*period; since < 0.06 {
+			punch = punchKick * scale
+		}
+		low := sub * scale
+		sn := snare * scale
+		out[i] = beatInput{Low: low, Punch: punch, Snare: sn,
+			Combined: 0.55*low + 0.30*punch + 0.15*sn}
+	}
+	return out
+}
+
+func countFires(b *beatTracker, sig []beatInput, now time.Time, from, to float64) int {
+	fires := 0
+	for i, in := range sig {
+		tt := float64(i) / 60
+		if _, fired := b.updateInput(in, now.Add(time.Duration(i)*time.Second/60)); fired && tt >= from && tt < to {
+			fires++
+		}
+	}
+	return fires
+}
+
+func TestBeatSaturated808WithKick(t *testing.T) {
+	b := beatTracker{cooldown: DefaultBeatCooldown}
+	now := time.Now()
+	// Sustained 0.85 sub floor; kicks live only in upper-bass punch.
+	sig := bandTrain(6, 60.0/140.0, 0.85, 1.0, 0.1, 1.0)
+	if fires := countFires(&b, sig, now, 2, 6); fires < 6 {
+		t.Errorf("saturated 808 fired %d times in 4s, want >= 6 of ~9 kicks", fires)
+	}
+	if ev := b.lastEvent; ev.Strength <= 0 {
+		t.Errorf("beat strength not recorded: %+v", ev)
+	}
+}
+
+func TestBeatQuietVolumeTrack(t *testing.T) {
+	b := beatTracker{cooldown: DefaultBeatCooldown}
+	now := time.Now()
+	// Same train at 20% amplitude must still fire and lock tempo.
+	sig := bandTrain(9, 60.0/140.0, 0.45, 0.9, 0.1, 0.2)
+	fires := countFires(&b, sig, now, 4, 7)
+	if fires < 5 {
+		t.Errorf("quiet track fired %d times in middle, want >= 5", fires)
+	}
+	if !b.confident || b.bpm < 130 || b.bpm > 150 {
+		t.Errorf("quiet track tempo confident=%v bpm=%.1f, want ~140 locked", b.confident, b.bpm)
+	}
+}
+
+func TestBeatSyncopationPreservesGrid(t *testing.T) {
+	b := beatTracker{cooldown: DefaultBeatCooldown}
+	now := time.Now()
+	sig := bandTrain(9, 60.0/140.0, 0.45, 0.9, 0.1, 1.0)
+	for i, in := range sig {
+		b.updateInput(in, now.Add(time.Duration(i)*time.Second/60))
+	}
+	if !b.confident {
+		t.Fatal("tempo should be confident before syncopation")
+	}
+	before := b.nextBeat
+	period := time.Duration(60 / b.bpm * float64(time.Second))
+	// One loud off-beat hit halfway between grid points.
+	offTime := before.Add(period / 2)
+	hit := beatInput{Low: 1, Punch: 1, Snare: 0.2, Combined: 0.9}
+	if _, fired := b.updateInput(hit, offTime); !fired {
+		t.Fatal("syncopated hit should still fire visually")
+	}
+	// Grid phase must survive: nextBeat stays within 60ms of a grid point
+	// derived from the pre-hit grid.
+	diff := b.nextBeat.Sub(before)
+	rem := diff % period
+	if rem < 0 {
+		rem += period
+	}
+	if rem > 60*time.Millisecond && period-rem > 60*time.Millisecond {
+		t.Errorf("grid derailed by syncopation: nextBeat shifted %v off grid (period %v)", rem, period)
+	}
+}
+
+func TestBeatInputFromRaw(t *testing.T) {
+	raw := make([]int, numBars)
+	raw[0], raw[1] = 100, 100
+	raw[0+numBands], raw[1+numBands] = 100, 100
+	raw[4], raw[5], raw[6] = 90, 90, 90
+	in := beatInputFromRaw(raw)
+	if in.Low != 1 {
+		t.Errorf("low = %v, want 1", in.Low)
+	}
+	if in.Snare < 0.4 {
+		t.Errorf("snare = %v, want stereo-averaged ~0.45", in.Snare)
+	}
+	if got := beatInputFromRaw([]int{1, 2}); got != (beatInput{}) {
+		t.Errorf("short frame = %+v, want zero", got)
+	}
+}
+
 func TestAspectDistance(t *testing.T) {
 	// A key 0.1 right of center must be as far as the aspect suggests:
 	// 0.1 * 2.8 = 0.28 physical units.

@@ -27,10 +27,7 @@ Usage: ak820-utils <command> [args]
 
 Commands:
   mole                        Whack-a-mole on the physical keyboard
-  visualizer [--theme T] [--accent-rainbow[=B]]
-                              Audio spectrum (requires cava); T: ` + themeList() + `
-                              B: true|false, tempo rainbow on the top row
-                              and nav cluster (default true; ` + "`a`" + ` toggles live)
+  visualizer [--theme T]      Audio spectrum (requires cava); T: ` + themeList() + `
   version                     Print version
 
 Both commands drive the keyboard through the ` + "`ak820`" + ` core binary
@@ -89,15 +86,14 @@ func run(args []string) int {
 
 // vizOptions are the visualizer flags.
 type vizOptions struct {
-	theme  string
-	accent bool
+	theme string
 }
 
-// parseVisualizerArgs accepts `--theme T` / `--theme=T` and
-// `--accent-rainbow[=B]` / `--no-accent-rainbow`, and rejects unknown flags
-// and stray positionals so typos never silently run a default.
+// parseVisualizerArgs accepts `--theme T` / `--theme=T` and rejects
+// unknown flags and stray positionals so typos never silently run a
+// default.
 func parseVisualizerArgs(args []string) (vizOptions, error) {
-	opts := vizOptions{theme: "synthwave", accent: true}
+	opts := vizOptions{theme: "synthwave"}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if a == "--theme" {
@@ -111,24 +107,11 @@ func parseVisualizerArgs(args []string) (vizOptions, error) {
 				return opts, fmt.Errorf("--theme needs a value; valid: %s", themeList())
 			}
 			opts.theme = rest
-		} else if a == "--accent-rainbow" {
-			opts.accent = true
-		} else if a == "--no-accent-rainbow" {
-			opts.accent = false
-		} else if rest, ok := strings.CutPrefix(a, "--accent-rainbow="); ok {
-			switch strings.ToLower(rest) {
-			case "1", "true", "yes", "on":
-				opts.accent = true
-			case "0", "false", "no", "off":
-				opts.accent = false
-			default:
-				return opts, fmt.Errorf("--accent-rainbow needs true or false (got %q)", rest)
-			}
 		} else if a == "--help" || a == "-h" || a == "help" {
 			fmt.Print(usage)
 			os.Exit(0)
 		} else {
-			return opts, fmt.Errorf("unknown argument %q for visualizer; valid: --theme %s --accent-rainbow[=true|false]", a, themeList())
+			return opts, fmt.Errorf("unknown argument %q for visualizer; valid: --theme %s", a, themeList())
 		}
 	}
 	valid := false
@@ -286,7 +269,6 @@ func runVisualizer(opts vizOptions) (code int) {
 		_ = closeAndRestore(board)
 		return 2
 	}
-	m.SetAccent(opts.accent)
 	prog := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := prog.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)

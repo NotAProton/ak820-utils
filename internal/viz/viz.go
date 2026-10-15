@@ -97,16 +97,12 @@ func ThemeNames() []string {
 
 // keyCell is one physical key: its RGB slot, its normalized board
 // position, and its physical x (aspect-corrected) for radial effects.
-// Accent keys (top row plus the nav cluster) carry a rainbow index for the
-// tempo-synced overlay.
 type keyCell struct {
-	slot     int
-	bar      int
-	row      int
-	x, y     float64
-	px, py   float64
-	accent   bool
-	accentIx int
+	slot   int
+	bar    int
+	row    int
+	x, y   float64
+	px, py float64
 }
 
 var ambient = [3]byte{2, 0, 8}
@@ -133,7 +129,6 @@ func layout(board *kb.KB) []keyCell {
 		{0.04, 0.09, 0.14, 0.22, 0.45, 0.49, 0.53, 0.58, 0.62, 0.66},
 	}
 	var cells []keyCell
-	accentIx := 0
 	for r, row := range rows {
 		if r >= len(rowX) {
 			continue
@@ -154,23 +149,10 @@ func layout(board *kb.KB) []keyCell {
 			if bar < 0 {
 				bar = 0
 			}
-			// The accent overlay owns the full top row (Esc, F1-F12,
-			// Del) plus the nav cluster (Home, PgUp, PgDn, End).
-			// Indices run left to right along the top row, then in
-			// row order through the nav keys, so the rainbow spreads
-			// across the board instead of repeating per key.
-			accent := r == 0 ||
-				name == "home" || name == "pgup" || name == "pgdn" || name == "end"
-			ix := -1
-			if accent {
-				ix = accentIx
-				accentIx++
-			}
 			cells = append(cells, keyCell{
 				slot: slot, bar: bar, row: r,
 				x: x, y: float64(r) / float64(numRows-1),
 				px: x * kbAspect, py: float64(r) / float64(numRows-1),
-				accent: accent, accentIx: ix,
 			})
 		}
 	}
@@ -220,19 +202,12 @@ func New(board *kb.KB, themeName string) (Model, error) {
 	m.lastFrame = time.Now()
 	m.lastPaint = time.Now()
 	m.fx.beats.cooldown = DefaultBeatCooldown
-	m.fx.accentOn = true
 	m.fx.beatPeriod = 0.5
 	if err := m.startCava(); err != nil {
 		m.cleanupFailedStart()
 		return Model{}, err
 	}
 	return m, nil
-}
-
-// SetAccent enables or disables the tempo-synced rainbow overlay on the
-// top row and nav cluster. It applies live and is safe to call before Run.
-func (m *Model) SetAccent(on bool) {
-	m.fx.accentOn = on
 }
 
 func indexOfTheme(name string) (int, bool) {
@@ -408,14 +383,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Fold the frame into the shared spectrum the modes read.
 		deriveSpectrum(&m.spec, msg, dt)
-		// Beat detection reads instantaneous (unsmoothed) bass: smoothing
-		// blunts the transient edge a kick is. Bands 0-2 hold the left
-		// low end, bands 9-11 the right.
-		inst := float64(msg[0]+msg[1]+msg[2]+msg[numBands]+msg[numBands+1]+msg[numBands+2]) / 600
-		if m.fx.beats.update(inst, now) {
-			m.fx.noteBeat(now)
+		// Beat detection reads instantaneous (unsmoothed) multi-band
+		// energy: smoothing blunts the transient edge a kick is.
+		if ev, fired := m.fx.beats.updateInput(beatInputFromRaw([]int(msg)), now); fired {
+			m.fx.noteBeatEvent(now, ev)
 			m.fx.ripples = append(m.fx.ripples,
-				ripple{start: now, amp: 0.55 + 0.45*m.spec.bass})
+				ripple{start: now, amp: 0.35 + 0.65*ev.Strength})
 			if len(m.fx.ripples) > 8 {
 				m.fx.ripples = m.fx.ripples[len(m.fx.ripples)-8:]
 			}
@@ -464,8 +437,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(themes) > 0 {
 				m.themeIx = (m.themeIx + 1) % len(themes)
 			}
-		case "a":
-			m.fx.accentOn = !m.fx.accentOn
 		}
 	}
 	return m, nil
@@ -506,11 +477,6 @@ func (m *Model) paintKeyboard(now time.Time, dt float64) {
 			rgb = m.paintStrobe(c, t, now, &m.spec)
 		default:
 			rgb = m.paintRipple(c, t, now, &m.spec)
-		}
-		// The accent overlay owns the top row and nav cluster in every
-		// mode when enabled; other keys always show the active mode.
-		if m.fx.accentOn && c.accent {
-			rgb = m.paintAccent(c, now, &m.spec)
 		}
 		m.kb.SetSlot(c.slot, rgb[0], rgb[1], rgb[2])
 	}
@@ -580,7 +546,8 @@ func (m Model) View() string {
 		ui.Badge("ak820 spectrum", true), " ",
 		ui.Pill(t.name, ui.ColorSparkleGold), " ",
 		ui.Pill(modeNames[modeIx], ui.ColorRainbowBlue), " ",
-		accentPill(m.fx.accentOn))
+		ui.Pill(bpmLabel(m), ui.ColorRainbowPurple), " ",
+		beatPill(m))
 
 	strip := ui.RenderRainbowStrip(width - 4)
 
@@ -597,7 +564,10 @@ func (m Model) View() string {
 			if bar < len(m.peaks) {
 				pk = m.peaks[bar]
 			}
+			flash := modeIx == modeStrobe && beatFlash(m)
 			switch {
+			case flash && lvl > 0.01:
+				line.WriteString(fgStyle(t.peakColor).Render("██"))
 			case lvl > 0.01 && threshold <= lvl:
 				line.WriteString(fgStyle(t.colors[colorIndex(lvl)]).Render("██"))
 			case abs(threshold-pk) < 0.14 && pk > 0.15:
@@ -638,7 +608,8 @@ func (m Model) View() string {
 	lvlBar := strings.Repeat("■", level) + strings.Repeat("·", 12-level)
 	sideBody := "MODES\n" + strings.Join(modeLines, "\n") +
 		"\n\nTHEMES\n" + strings.Join(themeLines, "\n") +
-		"\n\nACCENT " + accentState(m.fx.accentOn) +
+		"\n\nTEMPO " + bpmLabel(m) +
+		"\nBEATS " + fmt.Sprintf("%d", m.fx.beatCount) +
 		"\nLEVEL " + fgStyle(string(ui.ColorRainbowGreen)).Render(lvlBar)
 	if modeIx == modeStrobe {
 		sideBody += "\n" + ui.StyleMiss.Render("⚠ strobe: photosensitivity caution")
@@ -653,22 +624,31 @@ func (m Model) View() string {
 	if lipgloss.Width(body) > width {
 		body = specCard + "\n" + sideCard
 	}
-	help := ui.StyleDim.Render(" m/tab: mode ✦ t: theme ✦ a: accent ✦ q: quit")
+	help := ui.StyleDim.Render(" m/tab: mode ✦ t: theme ✦ q: quit")
 	return header + "\n" + strip + "\n" + body + "\n" + help
 }
 
-// accentState reports the overlay toggle for the side card.
-func accentState(on bool) string {
-	if on {
-		return ui.StyleMain.Render("» rainbow tempo ★")
+// bpmLabel reports the locked tempo, or a searching placeholder.
+func bpmLabel(m Model) string {
+	if m.fx.beats.confident && m.fx.beats.bpm > 0 {
+		return fmt.Sprintf("%d BPM ✦", int(m.fx.beats.bpm+0.5))
 	}
-	return ui.StyleDim.Render("· off (a to enable)")
+	if m.fx.beats.bpm > 0 {
+		return fmt.Sprintf("%d BPM ?", int(m.fx.beats.bpm+0.5))
+	}
+	return "-- BPM"
 }
-func accentPill(on bool) string {
-	if on {
-		return ui.Pill("ACCENT", ui.ColorRainbowGreen)
+
+// beatFlash reports whether a beat landed in the last 120ms.
+func beatFlash(m Model) bool {
+	return !m.fx.lastBeat.IsZero() && time.Since(m.fx.lastBeat) < 120*time.Millisecond
+}
+
+func beatPill(m Model) string {
+	if beatFlash(m) {
+		return ui.Pill("● BEAT", ui.ColorRainbowRed)
 	}
-	return ui.StyleDim.Render("accent off")
+	return ui.StyleDim.Render("○ beat")
 }
 
 func colorIndex(lvl float64) int {

@@ -154,89 +154,214 @@ const beatWindow = 43
 // the onset gate adapts. Lags cover 60-200 BPM at 60fps.
 const (
 	tempoWindow    = 240 // ~4s of onset envelope
+	tempoWarmup    = 120 // ~2s: first estimate before the window fills
 	tempoRecompute = 30  // frames between tempo estimates (~0.5s)
 	minTempoLag    = 18  // 200 BPM
 	maxTempoLag    = 60  // 60 BPM
 )
 
-// predictFloor is the instantaneous energy a predicted (non-onset) beat
+// predictFloor is the normalized energy a predicted (non-onset) beat
 // needs: tempo may say "now", but silence stays dark.
 const predictFloor = 0.15
+
+// noiseGate is the raw combined energy below which input is silence,
+// regardless of peak normalization.
+const noiseGate = 0.04
+
+// beatKind classifies a fired beat for visual choreography.
+type beatKind int
+
+const (
+	kindKick beatKind = iota
+	kindSnare
+)
+
+// beatInput is one frame of instantaneous, unsmoothed sub-band energy.
+type beatInput struct {
+	Low      float64 // mono bands 0-1: sub / low kick
+	Punch    float64 // mono bands 2-3: upper-bass punch
+	Snare    float64 // mono bands 4-6: snare / transient crack
+	Combined float64 // weighted mix used for level and tempo
+}
+
+// beatInputFromRaw folds a raw cava frame (stereo: left bars then right
+// bars) into mono sub-bands. Short frames yield a zero input.
+func beatInputFromRaw(raw []int) beatInput {
+	if len(raw) < 2*numBands {
+		return beatInput{}
+	}
+	mono := func(i int) float64 {
+		v := (clampBarInt(raw[i]) + clampBarInt(raw[i+numBands])) / 2
+		return v
+	}
+	low := (mono(0) + mono(1)) / 2
+	punch := (mono(2) + mono(3)) / 2
+	snare := (mono(4) + mono(5) + mono(6)) / 3
+	return beatInput{Low: low, Punch: punch, Snare: snare,
+		Combined: 0.55*low + 0.30*punch + 0.15*snare}
+}
+
+func clampBarInt(v int) float64 {
+	if v < 0 {
+		v = 0
+	}
+	if v > 100 {
+		v = 100
+	}
+	return float64(v) / 100
+}
+
+// beatEvent describes a fired beat: strength scales visual impact, kind
+// selects choreography, and drop marks a high-energy hit after a dip.
+type beatEvent struct {
+	Strength  float64
+	Kind      beatKind
+	Drop      bool
+	Predicted bool
+}
 
 // minBeatContext is the frames needed before the detector arms (~200ms),
 // so startup transients never fire on an empty window.
 const minBeatContext = 12
 
-// beatTracker fires on bass onsets using instantaneous (unsmoothed) bass
-// energy against an adaptive threshold from the window mean and variance.
-// Dense sections raise the variance, which lowers the bar instead of
-// raising it, so kicks punch through a driving bassline that would defeat
-// a fixed-ratio-vs-average detector. Level-based hysteresis is gone: the
-// threshold rides the window, so hovering at a sustained level cannot
-// chatter and no dip-re-arm can starve dense music.
+// beatTracker fires on multi-band onsets. Each sub-band is normalized by
+// a fast-attack / slow-release peak follower, so quiet and loud sources
+// share one dynamic range. A beat fires on either an adaptive level cross
+// or a positive-flux spike above the flux window's mean + k*std, which
+// catches kicks punching through a saturated sub-bass floor where the
+// level barely moves. Dense sections raise the level variance, which
+// lowers the level bar instead of raising it.
 type beatTracker struct {
-	hist     [beatWindow]float64 // ring of instantaneous bass energies
+	hist     [beatWindow]float64 // ring of normalized combined energies
 	head     int
 	filled   int
 	last     time.Time
 	cooldown time.Duration
 
+	fluxHist   [beatWindow]float64 // ring of weighted onset flux
+	fluxHeadW  int
+	fluxFilled int
+
+	peakLow, peakPunch, peakSnare, peakComb float64
+	prevLow, prevPunch, prevSnare           float64
+	prevInit                                bool
+
 	fluxRing  [tempoWindow]float64 // onset strength envelope ring
 	fluxHead  int
 	fluxFull  bool
-	prevLog   float64
 	sinceTpo  int
 	bpm       float64 // estimated tempo, 0 when unknown
 	confident bool
 	nextBeat  time.Time // predicted beat phase on the tempo grid
+
+	lastEvent   beatEvent
+	dipFrames   int
+	wasDipped   bool
+	offCount    int
+	offResidual float64 // seconds, residual of pending off-grid phase
+	hasOff      bool
 }
 
 // DefaultBeatCooldown is the production backstop between beat fires.
 const DefaultBeatCooldown = 120 * time.Millisecond
 
-// update folds one instantaneous bass energy sample (0..1, pre-smoothing)
-// and reports whether it opens a beat.
+// update folds one scalar energy sample as an all-bands input. It is
+// kept for scalar callers and tests; production uses updateInput.
 func (b *beatTracker) update(e float64, now time.Time) bool {
-	if e < 0 {
-		e = 0
+	_, ok := b.updateInput(beatInput{Low: e, Punch: e, Snare: e, Combined: e}, now)
+	return ok
+}
+
+// peakStep advances a fast-attack / slow-release peak follower.
+func peakStep(peak, v float64) float64 {
+	if v >= peak {
+		return v
 	}
-	if e > 1 {
-		e = 1
+	return peak + (v-peak)*0.005
+}
+
+func peakScale(peak float64) float64 {
+	if peak < 0.12 {
+		return 0.12
+	}
+	return peak
+}
+
+// updateInput folds one multi-band frame and reports the fired event.
+func (b *beatTracker) updateInput(in beatInput, now time.Time) (beatEvent, bool) {
+	clampU := func(v float64) float64 {
+		if v < 0 {
+			return 0
+		}
+		if v > 1 {
+			return 1
+		}
+		return v
+	}
+	in.Low, in.Punch, in.Snare, in.Combined = clampU(in.Low), clampU(in.Punch), clampU(in.Snare), clampU(in.Combined)
+	silent := in.Combined < noiseGate
+	// Flux uses the pre-update peak scale so a jump from a quiet floor
+	// spikes even though the clamped level saturates.
+	var lowF, punchF, snareF float64
+	if b.prevInit && !silent {
+		lowF = clampU((in.Low - b.prevLow) / peakScale(b.peakLow))
+		if in.Low <= b.prevLow {
+			lowF = 0
+		}
+		punchF = clampU((in.Punch - b.prevPunch) / peakScale(b.peakPunch))
+		if in.Punch <= b.prevPunch {
+			punchF = 0
+		}
+		snareF = clampU((in.Snare - b.prevSnare) / peakScale(b.peakSnare))
+		if in.Snare <= b.prevSnare {
+			snareF = 0
+		}
+	}
+	flux := clampU(0.55*lowF + 0.30*punchF + 0.15*snareF)
+	b.peakLow = peakStep(b.peakLow, in.Low)
+	b.peakPunch = peakStep(b.peakPunch, in.Punch)
+	b.peakSnare = peakStep(b.peakSnare, in.Snare)
+	b.peakComb = peakStep(b.peakComb, in.Combined)
+	b.prevLow, b.prevPunch, b.prevSnare = in.Low, in.Punch, in.Snare
+	b.prevInit = true
+
+	e := clampU(in.Combined / peakScale(b.peakComb))
+	if silent {
+		e = 0
 	}
 	b.hist[b.head%beatWindow] = e
 	b.head++
 	if b.filled < beatWindow {
 		b.filled++
 	}
-	// Onset strength envelope: log-compressed bass flux (Bello-style).
-	// Log compression keeps loud sections from dominating the tempo
-	// estimate the way linear energy would.
-	l := math.Log(1 + 9*e)
-	f := l - b.prevLog
-	if f < 0 {
-		f = 0
+	b.fluxHist[b.fluxHeadW%beatWindow] = flux
+	b.fluxHeadW++
+	if b.fluxFilled < beatWindow {
+		b.fluxFilled++
 	}
-	// Overwrite the ring slot: stale onset strength must age out as the
-	// window turns over, never accumulate.
-	b.fluxRing[b.fluxHead%tempoWindow] = f
-	b.prevLog = l
+	// Onset envelope for tempo: weighted flux, already peak-normalized.
+	b.fluxRing[b.fluxHead%tempoWindow] = flux
 	b.fluxHead++
 	if b.fluxHead >= tempoWindow {
 		b.fluxFull = true
 	}
+	// Drop bookkeeping: a dip is 20+ frames under 30% normalized energy.
+	if e < 0.3 {
+		b.dipFrames++
+		if b.dipFrames >= 20 {
+			b.wasDipped = true
+		}
+	} else {
+		b.dipFrames = 0
+	}
 	b.sinceTpo++
-	if b.sinceTpo >= tempoRecompute && b.fluxFull {
+	if b.sinceTpo >= tempoRecompute && b.fluxHead >= tempoWarmup {
 		b.sinceTpo = 0
 		b.estimateTempo(now)
 	}
 	if b.filled < minBeatContext {
-		return false
+		return beatEvent{}, false
 	}
-	// Full-window statistics, deliberately untrimmed: kick spikes belong
-	// to the baseline, so marginal kicks keep firing. A hard step from
-	// quiet to loud may flash a few times while the window turns over,
-	// then goes quiet; real section changes carry their own onsets, so
-	// those flashes read as intentional.
 	var sum, sqSum float64
 	for i := 0; i < b.filled; i++ {
 		sum += b.hist[i]
@@ -247,9 +372,6 @@ func (b *beatTracker) update(e float64, now time.Time) bool {
 	if variance < 0 {
 		variance = 0
 	}
-	// Dense music (high variance) lowers the bar; sparse music keeps it
-	// strict. Clamped so neither dead silence nor white noise can force
-	// or suppress fire on its own; the absolute gate owns silence.
 	c := 1.45 - 6*variance
 	if c < 1.15 {
 		c = 1.15
@@ -257,27 +379,48 @@ func (b *beatTracker) update(e float64, now time.Time) bool {
 	if c > 1.5 {
 		c = 1.5
 	}
-	if e > 0.12 && e > mean*c && now.Sub(b.last) > b.cooldown {
-		b.fire(now)
-		return true
+	var fSum, fSq float64
+	for i := 0; i < b.fluxFilled; i++ {
+		fSum += b.fluxHist[i]
+		fSq += b.fluxHist[i] * b.fluxHist[i]
 	}
-	// Tempo prediction carries steady sections: with a confident tempo,
-	// fire on the grid when audio is present even without an onset. The
-	// energy floor keeps breakdowns dark, and falling more than a period
-	// behind resyncs silently instead of machine-gunning catch-up beats.
+	fMean := fSum / float64(b.fluxFilled)
+	fVar := fSq/float64(b.fluxFilled) - fMean*fMean
+	if fVar < 0 {
+		fVar = 0
+	}
+	fStd := math.Sqrt(fVar)
+
+	kind := kindKick
+	if snareF > lowF && snareF > punchF && snareF > 0.08 {
+		kind = kindSnare
+	}
+	strength := clamp01(0.4*e + 0.6*clamp01(flux*1.6))
+	drop := b.wasDipped && (e > 0.7 || flux > 0.25)
+	levelFire := e > 0.12 && e > mean*c
+	fluxFire := flux > 0.10 && flux > fMean+1.2*fStd
+	if !silent && (levelFire || fluxFire) && now.Sub(b.last) > b.cooldown {
+		ev := beatEvent{Strength: strength, Kind: kind, Drop: drop}
+		b.fireOnset(now, ev)
+		b.wasDipped = false
+		return ev, true
+	}
+	// Tempo prediction carries steady sections.
 	if b.confident && b.bpm > 0 && !b.nextBeat.IsZero() && now.Sub(b.last) > b.cooldown {
 		period := time.Duration(60 / b.bpm * float64(time.Second))
 		if now.After(b.nextBeat.Add(period)) {
 			b.nextBeat = now.Add(period)
-			return false
+			return beatEvent{}, false
 		}
-		if !now.Before(b.nextBeat) && e > predictFloor {
+		if !now.Before(b.nextBeat) && e > predictFloor && !silent {
 			b.nextBeat = b.nextBeat.Add(period)
-			b.fire(now)
-			return true
+			ev := beatEvent{Strength: clamp01(0.3 + 0.5*e), Kind: kindKick, Drop: drop, Predicted: true}
+			b.firePredicted(now, ev)
+			b.wasDipped = false
+			return ev, true
 		}
 	}
-	return false
+	return beatEvent{}, false
 }
 
 // estimateTempo runs an Ellis-style tempo estimate: autocorrelate the
@@ -285,15 +428,22 @@ func (b *beatTracker) update(e float64, now time.Time) bool {
 // range with continuity and center priors. Octave ambiguity is harmless
 // here: half- and double-time both land on the grid for lights.
 func (b *beatTracker) estimateTempo(now time.Time) {
-	// Mean-removed envelope in time order.
+	// Use whatever envelope is available: warmup at 2s, full 4s later.
+	n := b.fluxHead
+	if n > tempoWindow {
+		n = tempoWindow
+	}
+	if n < tempoWarmup {
+		return
+	}
 	var xs [tempoWindow]float64
 	var mean float64
-	for i := 0; i < tempoWindow; i++ {
-		xs[i] = b.fluxRing[(b.fluxHead-tempoWindow+i)%tempoWindow]
+	for i := 0; i < n; i++ {
+		xs[i] = b.fluxRing[(b.fluxHead-n+i+tempoWindow*2)%tempoWindow]
 		mean += xs[i]
 	}
-	mean /= tempoWindow
-	for i := range xs {
+	mean /= float64(n)
+	for i := 0; i < n; i++ {
 		xs[i] -= mean
 	}
 	var total float64
@@ -312,10 +462,10 @@ func (b *beatTracker) estimateTempo(now time.Time) {
 	var raw [maxTempoLag + 1]float64
 	for lag := minTempoLag; lag <= maxTempoLag; lag++ {
 		var acc float64
-		for i := lag; i < tempoWindow; i++ {
+		for i := lag; i < n; i++ {
 			acc += xs[i] * xs[i-lag]
 		}
-		acc /= float64(tempoWindow - lag)
+		acc /= float64(n - lag)
 		raw[lag] = acc
 		sumScore += acc
 		if score := acc * priorWeight(lag, curLag); score > bestScore {
@@ -427,14 +577,55 @@ func absF(v float64) float64 {
 	return v
 }
 
-// fire records a beat for cooldown, tempo confidence, and phase state.
-// Every fire re-bases the predicted grid: kicks (even syncopated ones)
-// are valid phase references for lights.
-func (b *beatTracker) fire(now time.Time) {
+// fireOnset records an onset beat. Near the predicted grid it pulls the
+// phase softly toward the hit; far off-grid it fires visually without
+// moving the grid unless consecutive hits agree on a new phase.
+func (b *beatTracker) fireOnset(now time.Time, ev beatEvent) {
 	b.last = now
-	if b.bpm > 0 {
-		b.nextBeat = now.Add(time.Duration(60 / b.bpm * float64(time.Second)))
+	b.lastEvent = ev
+	if b.bpm <= 0 {
+		return
 	}
+	period := 60 / b.bpm
+	periodDur := time.Duration(period * float64(time.Second))
+	if b.nextBeat.IsZero() || !b.confident {
+		b.nextBeat = now.Add(periodDur)
+		return
+	}
+	// Residual to the nearest grid point, in seconds (-period/2..period/2).
+	elapsed := now.Sub(b.nextBeat).Seconds()
+	k := math.Round(elapsed / period)
+	residual := elapsed - k*period
+	if absF(residual) <= 0.18*period {
+		// Soft pull: shift the whole grid by half the residual.
+		shift := time.Duration(residual * 0.5 * float64(time.Second))
+		b.nextBeat = b.nextBeat.Add(shift).Add(time.Duration((k + 1) * period * float64(time.Second)))
+		b.offCount, b.hasOff = 0, false
+		return
+	}
+	// Off-grid: count consecutive hits sharing a residual. Three in a
+	// row rebase; a lone syncopation leaves the grid alone.
+	if b.hasOff && absF(residual-b.offResidual) < 0.04 {
+		b.offCount++
+	} else {
+		b.offCount, b.offResidual, b.hasOff = 1, residual, true
+	}
+	if b.offCount >= 3 {
+		b.nextBeat = now.Add(periodDur)
+		b.offCount, b.hasOff = 0, false
+		return
+	}
+	// Keep the grid in the future without firing catch-up beats.
+	for !b.nextBeat.After(now) {
+		b.nextBeat = b.nextBeat.Add(periodDur)
+	}
+}
+
+// firePredicted records a tempo-grid beat; the caller already advanced
+// nextBeat, so phase is untouched here.
+func (b *beatTracker) firePredicted(now time.Time, ev beatEvent) {
+	b.last = now
+	b.lastEvent = ev
 }
 
 // spring follows a target with fast attack and slower release.
@@ -460,10 +651,6 @@ const (
 	rippleSpread = 0.10 // ring width (gaussian sigma)
 )
 
-// numAccentKeys is the accent row size (14 top-row keys plus 4 nav keys)
-// used to spread the rainbow hue across the overlay.
-const numAccentKeys = 18
-
 // modeState carries all per-mode dynamics across frames.
 type modeState struct {
 	beats   beatTracker
@@ -473,16 +660,24 @@ type modeState struct {
 	bloomR  spring
 	frame   uint32
 
-	accentOn   bool
-	beatCount  uint64
-	lastBeat   time.Time
-	beatPeriod float64 // seconds between beats, EMA
+	beatCount    uint64
+	lastBeat     time.Time
+	beatPeriod   float64 // seconds between beats, EMA
+	lastStrength float64
+	lastKind     beatKind
+	lastDrop     bool
 }
 
-// noteBeat records a bass onset for the tempo-synced accent overlay. The
-// period EMA is clamped to a musical range so stray triggers cannot freeze
-// or strobe the rainbow.
+// noteBeat records a beat with default impact. The
+// period EMA is clamped to a musical range so stray triggers cannot
+// freeze or strobe the beat-driven effects.
 func (fx *modeState) noteBeat(now time.Time) {
+	fx.noteBeatEvent(now, beatEvent{Strength: 0.7, Kind: kindKick})
+}
+
+// noteBeatEvent records a fired beat and its impact for beat-driven
+// effects (strobe, ripples, TUI indicator).
+func (fx *modeState) noteBeatEvent(now time.Time, ev beatEvent) {
 	if fx.beatPeriod <= 0 {
 		fx.beatPeriod = 0.5
 	}
@@ -499,39 +694,9 @@ func (fx *modeState) noteBeat(now time.Time) {
 	}
 	fx.lastBeat = now
 	fx.beatCount++
-}
-
-// paintAccent renders the mode-independent tempo overlay for the top row
-// and nav cluster: a rainbow that steps one full cycle every eight beats
-// and pulses bright on each onset. Hue spreads across the row so the board
-// shows a spectrum, not a single flashing color.
-func (m *Model) paintAccent(c keyCell, now time.Time, sp *spectrum) [3]byte {
-	tt := now.Sub(m.startT).Seconds()
-	if sp.quietFor >= 2 {
-		hue := tt*0.05 + float64(c.accentIx)/numAccentKeys
-		hue -= math.Floor(hue)
-		r, g, b := hsvRGB(hue, 0.7, 0.15)
-		return [3]byte{r, g, b}
-	}
-	period := m.fx.beatPeriod
-	if period <= 0 {
-		period = 0.5
-	}
-	age := tt
-	if !m.fx.lastBeat.IsZero() {
-		age = now.Sub(m.fx.lastBeat).Seconds()
-		if age < 0 {
-			age = 0
-		}
-	}
-	pulse := math.Exp(-age * 2.5)
-	ag := sp.gain()
-	floor := 0.22 + 0.25*minF(1, sp.overall*ag)
-	v := clamp01(floor + 0.78*pulse*(0.35+0.65*minF(1, sp.bass*ag+sp.flux*0.5)))
-	hue := float64(m.fx.beatCount)/8 + float64(c.accentIx)/numAccentKeys
-	hue -= math.Floor(hue)
-	r, g, b := hsvRGB(hue, 0.9, boost(v))
-	return [3]byte{r, g, b}
+	fx.lastStrength = clamp01(ev.Strength)
+	fx.lastKind = ev.Kind
+	fx.lastDrop = ev.Drop
 }
 
 // flicker returns a deterministic 0..1 sparkle for a slot. It interpolates
@@ -788,28 +953,52 @@ func (m *Model) paintPlasma(c keyCell, t theme, now time.Time, sp *spectrum) [3]
 	return [3]byte{r, g, b}
 }
 
-// strobePalette is the fixed synthwave rotation for strobe mode: hot
-// pink, purple, cyan, warning red, and pale yellow.
-var strobePalette = [][3]byte{
-	{255, 119, 169},
-	{186, 119, 255},
-	{59, 201, 255},
-	{255, 89, 131},
-	{255, 234, 108},
+const (
+	strobeIgnite   = 0.035 // xenon core, seconds
+	strobeAfterEnd = 0.135 // chromatic afterburn end, seconds
+	strobeEdgeEnd  = 0.175 // perimeter afterburn end, seconds
+)
+
+// strobePattern selects the ignition geometry for a beat.
+type strobePattern int
+
+const (
+	patSupernova strobePattern = iota
+	patSplit
+	patSlash
+)
+
+func (m *Model) strobePatternFor() strobePattern {
+	if m.fx.beatCount%4 == 0 && m.fx.beatCount > 0 {
+		return patSlash
+	}
+	if m.fx.lastKind == kindSnare || (m.fx.beats.bpm > 135 && m.fx.beatCount%2 == 1) {
+		return patSplit
+	}
+	return patSupernova
 }
 
-// strobeHold is how long the board stays full-bright after an onset before
-// the hard cut back to near-black.
-const strobeHold = 0.08 // seconds
+// mixRGB blends two colors by k in 0..1.
+func mixRGB(a, b [3]byte, k float64) [3]byte {
+	k = clamp01(k)
+	return [3]byte{
+		byte(float64(a[0]) + (float64(b[0])-float64(a[0]))*k),
+		byte(float64(a[1]) + (float64(b[1])-float64(a[1]))*k),
+		byte(float64(a[2]) + (float64(b[2])-float64(a[2]))*k),
+	}
+}
 
-// paintStrobe flashes the whole board in synthwave on every bass beat: a
-// hard snap from near-black to full-bright, a short hold, then a hard cut.
-// The color steps through the synthwave palette per beat. Between beats the
-// board sits near-black with a faint bass glow; in silence it breathes dim
-// instead of strobing.
+func scaleRGB(c [3]byte, k float64) [3]byte {
+	k = clamp01(k)
+	return [3]byte{byte(float64(c[0]) * k), byte(float64(c[1]) * k), byte(float64(c[2]) * k)}
+}
+
+// paintStrobe is the Overdrive Strobe: a white-hot xenon ignition with
+// rotating spatial geometry, a chromatic afterburn cooling through the
+// active theme, and a near-black gap lit only by sub-bass undercurrent
+// on the bottom row and treble arc sparks. Drops and every 8th beat
+// double-tap. Silence breathes dim instead of strobing.
 func (m *Model) paintStrobe(c keyCell, t theme, now time.Time, sp *spectrum) [3]byte {
-	_ = t
-	_ = c
 	tt := now.Sub(m.startT).Seconds()
 	if sp.quietFor >= 2 {
 		k := 0.5 + 0.5*math.Sin(tt*3.14159)
@@ -824,13 +1013,74 @@ func (m *Model) paintStrobe(c keyCell, t theme, now time.Time, sp *spectrum) [3]
 			age = 0
 		}
 	}
-	if age < strobeHold {
-		pal := strobePalette[m.fx.beatCount%uint64(len(strobePalette))]
-		return [3]byte{pal[0], pal[1], pal[2]}
+	strength := m.fx.lastStrength
+	if strength <= 0 {
+		strength = 0.7
 	}
-	ag := sp.gain()
-	floor := 0.015 + 0.06*minF(1, sp.bass*ag)
-	return [3]byte{byte(floor * 255), byte(floor * 60), byte(floor * 120)}
+	overdrive := m.fx.lastDrop || (m.fx.beatCount > 0 && m.fx.beatCount%8 == 0)
+	// Spatial travel: supernova reaches the edge in ~25ms; split and
+	// slash use position along their axis instead.
+	cx, cy := rippleX*kbAspect, rippleY
+	dx, dy := c.px-cx, c.py-cy
+	dist := math.Sqrt(dx*dx + dy*dy)
+	pat := m.strobePatternFor()
+	travel := dist / 1.6 * 0.025
+	active := 1.0
+	switch pat {
+	case patSplit:
+		left := c.x < 0.5
+		wantLeft := m.fx.beatCount%2 == 0
+		if left != wantLeft {
+			active = 0.07
+		}
+		travel = 0
+	case patSlash:
+		// Diagonal front sweeping top-left to bottom-right.
+		s := clamp01((c.px/2.8 + c.py) / 2)
+		travel = s * 0.025
+	}
+	local := age - travel
+	white := mixRGB([3]byte{255, 255, 255}, t.peakRGB, 0.25)
+	hot := scaleRGB(white, (0.45+0.55*strength)*active)
+	// Double-tap overdrive: second ignition after a blackout gap.
+	if overdrive && age >= 0.050 && age < 0.075 {
+		return hot
+	}
+	if overdrive && age >= strobeIgnite && age < 0.050 {
+		return [3]byte{1, 0, 3}
+	}
+	if local >= 0 && local < strobeIgnite {
+		return hot
+	}
+	edge := c.row == 0 || c.row == numRows-1 || c.x < 0.10 || c.x > 0.90
+	end := strobeAfterEnd
+	if edge {
+		end = strobeEdgeEnd
+	}
+	if local >= strobeIgnite && local < end {
+		k := (local - strobeIgnite) / (end - strobeIgnite)
+		gr, gg, gb := gradRGB(t.keyGrad, boost((1-k)*(0.45+0.55*strength)))
+		cool := mixRGB(white, [3]byte{gr, gg, gb}, 0.35+0.65*k)
+		return scaleRGB(cool, active)
+	}
+	// Dark gap: bottom row breathes with sub-bass; treble sparks arc.
+	if c.row == numRows-1 {
+		ag := sp.gain()
+		lvl := boost(clamp01(0.04 + 0.22*minF(1, sp.bass*ag)))
+		gr, gg, gb := gradRGB(t.keyGrad, lvl)
+		return [3]byte{gr, gg, gb}
+	}
+	hiOnset := 0.0
+	if len(sp.onset) > 8 {
+		hiOnset = sp.onset[7]
+		if sp.onset[8] > hiOnset {
+			hiOnset = sp.onset[8]
+		}
+	}
+	if sp.treble > 0.35 && hiOnset > 0.4 && hash01(c.slot, m.fx.frame) > 0.985 {
+		return scaleRGB(t.peakRGB, 0.9)
+	}
+	return [3]byte{1, 0, 3}
 }
 
 // toward Esc and Enter with an asymmetric trailing tail. Treble adds a
